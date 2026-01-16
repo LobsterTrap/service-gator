@@ -1,0 +1,51 @@
+[workspace]
+members = [".", "integration-tests"]
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "forbid"
+
+[workspace.dependencies]
+eyre = "0.6.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "signal"] }
+
+[package]
+name = "service-gator"
+version = "0.1.0"
+edition = "2021"
+description = "Scope-restricted CLI wrapper for sandboxed AI agents"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cgwalters/service-gator"
+keywords = ["ai", "security", "sandbox", "mcp", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.75"
+
+[[bin]]
+name = "service-gator"
+path = "src/bin/service_gator.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+rmcp = { version = "0.13", features = ["server", "transport-streamable-http-server"] }
+tokio = { workspace = true }
+tokio-util = "0.7"
+axum = "0.8"
+eyre = { workspace = true }
+# Native Forgejo/Gitea API client
+forgejo-api = "0.9"
+url = "2"
+# Native JIRA API client
+gouqi = { version = "0.20", features = ["async"] }
+# GraphQL query parsing for read-only validation
+graphql-parser = "0.4"
+
+[dev-dependencies]
+itertools = "0.14"
+
+[lints]
+workspace = true
