@@ -41,18 +41,32 @@ fn get_denied_repo() -> String {
 struct McpSession {
     client: reqwest::blocking::Client,
     mcp_url: String,
+    base_url: String,
     session_id: Option<String>,
     request_id: u64,
+    /// Optional Bearer token for authenticated requests
+    bearer_token: Option<String>,
 }
 
 impl McpSession {
     fn new(mcp_url: &str) -> Self {
+        // Extract base_url from mcp_url (remove /mcp suffix)
+        let base_url = mcp_url.trim_end_matches("/mcp").to_string();
         Self {
             client: reqwest::blocking::Client::new(),
             mcp_url: mcp_url.to_string(),
+            base_url,
             session_id: None,
             request_id: 0,
+            bearer_token: None,
         }
+    }
+
+    /// Create a session with a Bearer token for authentication
+    fn with_token(mcp_url: &str, token: &str) -> Self {
+        let mut session = Self::new(mcp_url);
+        session.bearer_token = Some(token.to_string());
+        session
     }
 
     fn next_id(&mut self) -> u64 {
@@ -60,20 +74,29 @@ impl McpSession {
         self.request_id
     }
 
-    /// Send an MCP request and return the response
-    fn send_request(&mut self, request: Value) -> Result<Value> {
+    /// Build a base request builder with common headers (auth, session).
+    fn build_mcp_request(&self) -> reqwest::blocking::RequestBuilder {
         let mut req_builder = self
             .client
             .post(&self.mcp_url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream");
 
-        // Include session ID if we have one
         if let Some(ref session_id) = self.session_id {
             req_builder = req_builder.header("Mcp-Session-Id", session_id);
         }
 
-        let response = req_builder
+        if let Some(ref token) = self.bearer_token {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", token));
+        }
+
+        req_builder
+    }
+
+    /// Send an MCP request and return the response
+    fn send_request(&mut self, request: Value) -> Result<Value> {
+        let response = self
+            .build_mcp_request()
             .json(&request)
             .send()
             .context("sending MCP request")?;
@@ -137,22 +160,53 @@ impl McpSession {
         });
 
         // For notifications, we don't expect a response with result
-        let mut req_builder = self
-            .client
-            .post(&self.mcp_url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream");
-
-        if let Some(ref session_id) = self.session_id {
-            req_builder = req_builder.header("Mcp-Session-Id", session_id);
-        }
-
-        let _response = req_builder
+        let _response = self
+            .build_mcp_request()
             .json(&request)
             .send()
             .context("sending initialized notification")?;
 
         Ok(())
+    }
+
+    /// Mint a new token from the admin endpoint
+    fn mint_token(&self, admin_key: &str, scopes_json: &Value, expires_in: u64) -> Result<String> {
+        let url = format!("{}/admin/mint-token", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("X-Admin-Key", admin_key)
+            .json(&json!({
+                "scopes": scopes_json,
+                "expires-in": expires_in
+            }))
+            .send()
+            .context("minting token")?;
+
+        if !response.status().is_success() {
+            let body = response.text()?;
+            return Err(eyre::eyre!("Failed to mint token: {}", body));
+        }
+
+        let body: Value = response.json()?;
+        let token = body["token"]
+            .as_str()
+            .ok_or_else(|| eyre::eyre!("No token in response"))?;
+        Ok(token.to_string())
+    }
+
+    /// Send a raw request and return the HTTP response status and body
+    fn send_raw_request(&self, request: Value) -> Result<(u16, String)> {
+        let response = self
+            .build_mcp_request()
+            .json(&request)
+            .send()
+            .context("sending MCP request")?;
+
+        let status = response.status().as_u16();
+        let body = response.text().context("reading response body")?;
+        Ok((status, body))
     }
 
     /// Call the gh tool via MCP
@@ -434,3 +488,257 @@ fn test_mcp_github_api_only() -> Result<()> {
     Ok(())
 }
 integration_test!(test_mcp_github_api_only);
+
+// ============================================================================
+// Token Authentication Tests
+// ============================================================================
+
+/// Test that token authentication works with auth mode "required"
+fn test_mcp_token_auth_required_mode() -> Result<()> {
+    let test_repo = get_test_repo();
+    let denied_repo = get_denied_repo();
+
+    // Configure server with auth mode "required" - no default scopes
+    // The token will provide the scopes
+    let config = r#"
+[server]
+secret = "test-secret-for-integration-tests"
+admin-key = "test-admin-key"
+mode = "required"
+
+[gh.repos]
+# No repos allowed by default - token must provide scopes
+"#;
+
+    let server = McpServerHandle::start(config)?;
+    let session = McpSession::new(&server.mcp_url());
+
+    // Try to access without token - should be rejected
+    let init_request = json!({
+        "jsonrpc": "2.0",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "1.0" }
+        },
+        "id": 1
+    });
+
+    let (status, _body) = session.send_raw_request(init_request)?;
+    assert_eq!(status, 401, "Expected 401 Unauthorized without token");
+
+    // Mint a token that allows access to test_repo only
+    let token_scopes = json!({
+        "gh": {
+            "repos": {
+                &test_repo: { "read": true }
+            }
+        }
+    });
+
+    let token = session.mint_token("test-admin-key", &token_scopes, 3600)?;
+
+    // Create a new session with the token
+    let mut auth_session = McpSession::with_token(&server.mcp_url(), &token);
+
+    // Initialize should now work
+    let init_response = auth_session.initialize()?;
+    assert!(
+        init_response.get("result").is_some(),
+        "Expected successful init with token"
+    );
+    auth_session.send_initialized()?;
+
+    // Access to test_repo should work
+    let api_path = format!("repos/{}", test_repo);
+    let response = auth_session.call_gh(vec!["api", &api_path])?;
+
+    let result = &response["result"];
+    let is_error = result
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+    assert!(
+        !is_error,
+        "Expected access to {} to succeed with token, got: {}",
+        test_repo, result
+    );
+
+    // Access to denied_repo should fail (not in token scopes)
+    let denied_path = format!("repos/{}", denied_repo);
+    let denied_response = auth_session.call_gh(vec!["api", &denied_path])?;
+
+    let denied_result = &denied_response["result"];
+    let denied_is_error = denied_result
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+    assert!(
+        denied_is_error,
+        "Expected access to {} to be denied by token scopes, got: {}",
+        denied_repo, denied_result
+    );
+
+    Ok(())
+}
+integration_test!(test_mcp_token_auth_required_mode);
+
+/// Test that token scopes override server default scopes
+fn test_mcp_token_scopes_override_defaults() -> Result<()> {
+    let test_repo = get_test_repo();
+    let denied_repo = get_denied_repo();
+
+    // Server allows denied_repo by default, but NOT test_repo
+    let config = format!(
+        r#"
+[server]
+secret = "test-secret"
+admin-key = "admin-key"
+mode = "optional"
+
+[gh.repos]
+"{}" = {{ read = true }}
+"#,
+        denied_repo
+    );
+
+    let server = McpServerHandle::start(&config)?;
+    let session = McpSession::new(&server.mcp_url());
+
+    // Without token, denied_repo should be accessible (server default)
+    let mut no_token_session = McpSession::new(&server.mcp_url());
+    let _ = no_token_session.initialize()?;
+    no_token_session.send_initialized()?;
+
+    let default_path = format!("repos/{}", denied_repo);
+    let default_response = no_token_session.call_gh(vec!["api", &default_path])?;
+    let default_is_error = default_response["result"]
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+    assert!(
+        !default_is_error,
+        "Expected denied_repo to be accessible with default scopes"
+    );
+
+    // Now mint a token that only allows test_repo (different from server default)
+    let token_scopes = json!({
+        "gh": {
+            "repos": {
+                &test_repo: { "read": true }
+            }
+        }
+    });
+
+    let token = session.mint_token("admin-key", &token_scopes, 3600)?;
+
+    // With token, test_repo should be accessible
+    let mut auth_session = McpSession::with_token(&server.mcp_url(), &token);
+    let _ = auth_session.initialize()?;
+    auth_session.send_initialized()?;
+
+    let test_path = format!("repos/{}", test_repo);
+    let test_response = auth_session.call_gh(vec!["api", &test_path])?;
+    let test_is_error = test_response["result"]
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+    assert!(
+        !test_is_error,
+        "Expected test_repo to be accessible with token scopes, got: {}",
+        test_response["result"]
+    );
+
+    // With token, denied_repo should NOT be accessible (token scopes don't include it)
+    let denied_with_token = auth_session.call_gh(vec!["api", &default_path])?;
+    let denied_with_token_error = denied_with_token["result"]
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+    assert!(
+        denied_with_token_error,
+        "Expected denied_repo to be blocked by token scopes (overrides server default), got: {}",
+        denied_with_token["result"]
+    );
+
+    Ok(())
+}
+integration_test!(test_mcp_token_scopes_override_defaults);
+
+/// Test that invalid tokens are rejected
+fn test_mcp_invalid_token_rejected() -> Result<()> {
+    let config = r#"
+[server]
+secret = "correct-secret"
+admin-key = "admin-key"
+mode = "required"
+
+[gh.repos]
+"example/repo" = { read = true }
+"#;
+
+    let server = McpServerHandle::start(config)?;
+
+    // Try with a completely invalid token
+    let session = McpSession::with_token(&server.mcp_url(), "not-a-valid-jwt");
+
+    let init_request = json!({
+        "jsonrpc": "2.0",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "test", "version": "1.0" }
+        },
+        "id": 1
+    });
+
+    let (status, _body) = session.send_raw_request(init_request)?;
+    assert_eq!(status, 401, "Expected 401 for invalid token");
+
+    Ok(())
+}
+integration_test!(test_mcp_invalid_token_rejected);
+
+/// Test auth mode "none" allows unauthenticated access with default scopes
+fn test_mcp_auth_mode_none() -> Result<()> {
+    let test_repo = get_test_repo();
+
+    // Auth mode "none" - tokens are ignored, default scopes always used
+    let config = format!(
+        r#"
+[server]
+secret = "some-secret"
+admin-key = "admin-key"
+mode = "none"
+
+[gh.repos]
+"{}" = {{ read = true }}
+"#,
+        test_repo
+    );
+
+    let server = McpServerHandle::start(&config)?;
+    let mut session = McpSession::new(&server.mcp_url());
+
+    // Should work without any token
+    let _ = session.initialize()?;
+    session.send_initialized()?;
+
+    let api_path = format!("repos/{}", test_repo);
+    let response = session.call_gh(vec!["api", &api_path])?;
+
+    let is_error = response["result"]
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+    assert!(
+        !is_error,
+        "Expected access in mode=none without token, got: {}",
+        response["result"]
+    );
+
+    Ok(())
+}
+integration_test!(test_mcp_auth_mode_none);

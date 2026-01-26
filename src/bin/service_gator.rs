@@ -11,7 +11,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use eyre::{bail, Context, Result};
+use tracing_subscriber::prelude::*;
 
+use service_gator::auth::ServerConfig;
 use service_gator::core::run_command;
 use service_gator::forgejo;
 use service_gator::github;
@@ -22,6 +24,21 @@ use service_gator::scope::{
     ForgejoRepoPermission, ForgejoScope, GhRepoPermission, GlProjectPermission,
     JiraProjectPermission, ScopeConfig,
 };
+
+/// Initialize tracing with env-filter support (RUST_LOG).
+fn init_tracing() {
+    let format = tracing_subscriber::fmt::format()
+        .without_time()
+        .with_target(false)
+        .compact();
+
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .event_format(format)
+        .with_writer(std::io::stderr)
+        .with_filter(tracing_subscriber::EnvFilter::from_default_env());
+
+    tracing_subscriber::registry().with(fmt_layer).init();
+}
 
 /// Scope-restricted CLI wrapper for sandboxed AI agents
 #[derive(Parser)]
@@ -116,10 +133,12 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    init_tracing();
+
     match try_main() {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("error: {e:#}");
+            tracing::error!("{e:#}");
             ExitCode::from(1)
         }
     }
@@ -130,71 +149,74 @@ fn try_main() -> Result<ExitCode> {
     let cli = Cli::parse();
 
     // Build config from file + CLI args
-    let config = build_config(&cli)?;
+    let server_config = build_config(&cli)?;
 
     // MCP server mode
     if let Some(addr) = cli.mcp_server {
-        return run_mcp_server(&addr, config);
+        return run_mcp_server(&addr, server_config);
     }
 
+    // For CLI commands, we only need the scope config
+    let config = &server_config.scopes;
+
     match cli.command {
-        Some(Command::Gh { args }) => run_gh(&config, args),
-        Some(Command::Gl { args }) => run_gl(&config, args),
-        Some(Command::Jira { args }) => run_jira(&config, args),
-        Some(Command::Forgejo { args }) => run_forgejo(&config, args),
+        Some(Command::Gh { args }) => run_gh(config, args),
+        Some(Command::Gl { args }) => run_gl(config, args),
+        Some(Command::Jira { args }) => run_jira(config, args),
+        Some(Command::Forgejo { args }) => run_forgejo(config, args),
         None => bail!("no command provided; run 'service-gator --help' for usage"),
     }
 }
 
 /// Run the MCP server.
-fn run_mcp_server(addr: &str, config: ScopeConfig) -> Result<ExitCode> {
+fn run_mcp_server(addr: &str, config: ServerConfig) -> Result<ExitCode> {
     let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
-    rt.block_on(service_gator::mcp::start_server(addr, config))
+    rt.block_on(service_gator::mcp::start_server_with_config(addr, config))
         .context("MCP server failed")?;
 
     Ok(ExitCode::SUCCESS)
 }
 
 /// Build configuration from file + CLI arguments.
-fn build_config(cli: &Cli) -> Result<ScopeConfig> {
+fn build_config(cli: &Cli) -> Result<ServerConfig> {
     // Start with file config if provided, otherwise empty
     let mut config = if let Some(path) = &cli.config_file {
         load_config_file(path)?
     } else {
-        ScopeConfig::default()
+        ServerConfig::default()
     };
 
     // Merge JSON scope if provided
     if let Some(json) = &cli.scope_json {
         let json_config: ScopeConfig =
             serde_json::from_str(json).context("parsing --scope JSON")?;
-        merge_config(&mut config, json_config);
+        merge_config(&mut config.scopes, json_config);
     }
 
     // Parse and merge --gh-repo flags
     for spec in &cli.gh_repos {
         let (repo, perm) =
             parse_gh_repo_spec(spec).with_context(|| format!("parsing --gh-repo '{spec}'"))?;
-        config.gh.repos.insert(repo, perm);
+        config.scopes.gh.repos.insert(repo, perm);
     }
 
     // Parse and merge --jira-project flags
     for spec in &cli.jira_projects {
         let (project, perm) = parse_jira_project_spec(spec)
             .with_context(|| format!("parsing --jira-project '{spec}'"))?;
-        config.jira.projects.insert(project, perm);
+        config.scopes.jira.projects.insert(project, perm);
     }
 
     // Parse and merge --gitlab-project flags
     for spec in &cli.gitlab_projects {
         let (project, perm) = parse_gitlab_project_spec(spec)
             .with_context(|| format!("parsing --gitlab-project '{spec}'"))?;
-        config.gitlab.projects.insert(project, perm);
+        config.scopes.gitlab.projects.insert(project, perm);
     }
 
     // Set GitLab host if provided
     if let Some(host) = &cli.gitlab_host {
-        config.gitlab.host = Some(host.clone());
+        config.scopes.gitlab.host = Some(host.clone());
     }
 
     // Parse and merge --forgejo-host and --forgejo-repo flags
@@ -214,6 +236,7 @@ fn build_config(cli: &Cli) -> Result<ScopeConfig> {
 
             // Find or create the scope for this host
             let scope = config
+                .scopes
                 .forgejo
                 .iter_mut()
                 .find(|s| s.host == host)
@@ -222,11 +245,11 @@ fn build_config(cli: &Cli) -> Result<ScopeConfig> {
             let scope = if let Some(s) = scope {
                 s
             } else {
-                config.forgejo.push(ForgejoScope {
+                config.scopes.forgejo.push(ForgejoScope {
                     host: host.clone(),
                     ..Default::default()
                 });
-                config.forgejo.last_mut().unwrap()
+                config.scopes.forgejo.last_mut().unwrap()
             };
 
             for spec in &cli.forgejo_repos {
@@ -237,8 +260,8 @@ fn build_config(cli: &Cli) -> Result<ScopeConfig> {
         } else {
             // Multiple hosts: just create empty scopes, user should use config file for repos
             for host in &cli.forgejo_hosts {
-                if !config.forgejo.iter().any(|s| &s.host == host) {
-                    config.forgejo.push(ForgejoScope {
+                if !config.scopes.forgejo.iter().any(|s| &s.host == host) {
+                    config.scopes.forgejo.push(ForgejoScope {
                         host: host.clone(),
                         ..Default::default()
                     });
@@ -256,7 +279,7 @@ fn build_config(cli: &Cli) -> Result<ScopeConfig> {
 }
 
 /// Load configuration from an explicit path.
-fn load_config_file(path: &std::path::Path) -> Result<ScopeConfig> {
+fn load_config_file(path: &std::path::Path) -> Result<ServerConfig> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let config = toml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;

@@ -122,7 +122,6 @@ The agent (running in a sandbox) connects to `http://host-ip:8080/mcp` using the
 | `--forgejo-repo` | `OWNER/REPO:PERMS` | `--forgejo-repo user/repo:read` |
 | `--jira-project` | `PROJECT:PERMS` | `--jira-project MYPROJ:read,create` |
 | `--scope` | JSON | `--scope '{"gh":{"repos":{"o/r":{"read":true}}}}'` |
-| `--no-config-file` | (flag) | Skip loading `~/.config/service-gator.toml` |
 
 **GitHub permissions**: `read`, `create-draft`, `pending-review`, `write`
 
@@ -132,7 +131,7 @@ The agent (running in a sandbox) connects to `http://host-ip:8080/mcp` using the
 
 **JIRA permissions**: `read`, `create`, `write`
 
-Inline options are merged with the config file (inline takes precedence). Use `--no-config-file` to ignore the config file entirely.
+Inline options are merged with the config file (inline takes precedence).
 
 ## Configuration
 
@@ -283,6 +282,99 @@ Wraps [jirust-cli](https://github.com/ilpianista/jirust-cli). Provides project-s
 - Project-based access control
 - Issue key parsing (e.g., `PROJ-123`)
 - Command classification for all major operations
+
+## Token Authentication (Experimental)
+
+service-gator supports JWT-based token authentication for multi-tenant deployments. Instead of configuring scopes at server startup, scopes can be embedded in signed tokens that agents present via Bearer authentication.
+
+### Use Case
+
+A single service-gator instance can serve multiple sandboxed agents, each with their own scope-restricted access:
+
+1. Human/admin mints a scoped token for an agent
+2. Token is passed to the sandbox environment
+3. Agent uses the token for authentication
+4. Token can be rotated (refreshed) without admin intervention
+
+### Configuration
+
+Add auth settings to your config file:
+
+```toml
+[server]
+# Secret key for JWT signing (required for token auth)
+# Can also use SERVICE_GATOR_SECRET env var
+secret = "your-256-bit-secret-key-here"
+
+# Admin key for /admin/* endpoints
+# Can also use SERVICE_GATOR_ADMIN_KEY env var
+admin-key = "admin-secret-for-minting"
+
+# Auth mode: "required", "optional", or "none"
+mode = "required"
+
+[server.rotation]
+enabled = true           # Allow token self-rotation (default: true)
+max-lifetime = 86400     # Max token lifetime in seconds (optional)
+
+# Default scopes (used when auth is "optional" and no token provided)
+[gh.repos]
+"owner/repo" = { read = true }
+```
+
+### API Endpoints
+
+#### POST /admin/mint-token
+
+Create a new scoped token. Requires `X-Admin-Key` header.
+
+**Request:**
+```json
+{
+  "scopes": {
+    "gh": { "repos": { "owner/repo": { "read": true } } }
+  },
+  "expires-in": 3600,
+  "sub": "agent-123"
+}
+```
+
+**Response:**
+```json
+{
+  "token": "eyJhbG...",
+  "expires-at": 1706283600
+}
+```
+
+#### POST /token/rotate
+
+Refresh a token with a new expiration. Requires valid `Authorization: Bearer <token>` header.
+
+**Request:**
+```json
+{
+  "expires-in": 3600
+}
+```
+
+**Response:**
+```json
+{
+  "token": "eyJhbG...",
+  "expires-at": 1706287200
+}
+```
+
+**Constraints:**
+- Token must have `can_rotate: true` (default)
+- New expiration cannot exceed `original_iat + max_exp_delta`
+- Rotated token has identical scopes to the original
+
+### Current Limitations
+
+- MCP requests currently use the default scopes from server config, not token scopes
+- Token-based scope enforcement for MCP is planned for a future release
 
 ## Security Model
 

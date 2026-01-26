@@ -36,6 +36,7 @@ rmcp = { version = "0.13", features = ["server", "transport-streamable-http-serv
 tokio = { workspace = true }
 tokio-util = "0.7"
 axum = "0.8"
+http = "1"
 eyre = { workspace = true }
 # Native Forgejo/Gitea API client
 forgejo-api = "0.9"
@@ -44,6 +45,13 @@ url = "2"
 gouqi = { version = "0.20", features = ["async"] }
 # GraphQL query parsing for read-only validation
 graphql-parser = "0.4"
+# JWT token handling for bearer auth
+jsonwebtoken = "9"
+# Constant-time comparison for security
+subtle = "2"
+# Tracing for structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 itertools = "0.14"

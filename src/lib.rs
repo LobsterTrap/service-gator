@@ -45,6 +45,7 @@
 //! "MYPROJ" = { read = true, create = true }
 //! ```
 
+pub mod auth;
 pub mod core;
 pub mod forgejo;
 pub mod forgejo_client;
