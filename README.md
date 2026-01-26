@@ -40,13 +40,17 @@ The server exposes the following tools:
 
 ## Installation
 
+The recommended way to run service-gator is via the container image, which includes all required CLI tools (`gh`, `glab`, `tea`):
+
 ```bash
-cargo install service-gator
+podman pull ghcr.io/cgwalters/service-gator:latest
 ```
 
-Or build from source:
+Alternatively, build from source (requires `gh`, `glab`, and `tea` to be installed separately):
 
 ```bash
+cargo install service-gator
+# or
 git clone https://github.com/cgwalters/service-gator
 cd service-gator
 cargo build --release
@@ -65,7 +69,25 @@ export JIRA_API_TOKEN="xxxxxxxxxx"         # JIRA API token (for jirust-cli)
 
 ### 2. Start the MCP server
 
-For simple cases, use inline configuration—no config file needed:
+Using the container image (recommended):
+
+```bash
+# Single repo with read access
+podman run --rm -e GH_TOKEN \
+  ghcr.io/cgwalters/service-gator:latest \
+  --mcp-server 0.0.0.0:8080 --gh-repo myorg/myrepo:read
+
+# Multiple repos with different permissions
+podman run --rm -p 8080:8080 \
+  -e GH_TOKEN -e JIRA_API_TOKEN \
+  ghcr.io/cgwalters/service-gator:latest \
+  --mcp-server 0.0.0.0:8080 \
+  --gh-repo myorg/myrepo:read,create-draft \
+  --gh-repo myorg/other:read \
+  --jira-project MYPROJ:read
+```
+
+Or using the binary directly:
 
 ```bash
 # Single repo with read access
