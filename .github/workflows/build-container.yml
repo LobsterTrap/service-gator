@@ -28,8 +28,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install just
-        uses: extractions/setup-just@v2
+      - name: Setup host (newer podman with heredoc support, just)
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
 
       - name: Build and test container
         run: just container-test
@@ -52,8 +52,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install just
-        uses: extractions/setup-just@v2
+      - name: Setup host (newer podman with heredoc support, just)
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
 
       - name: Log in to Container Registry
         run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login -u ${{ github.actor }} --password-stdin ${{ env.REGISTRY }}

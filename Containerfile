@@ -3,21 +3,22 @@ FROM registry.access.redhat.com/ubi10/ubi:latest AS builder
 WORKDIR /src
 
 # Install Rust toolchain and build dependencies
-RUN <<EORUN
-set -xeuo pipefail
-dnf -y install gcc make git-core openssl-devel
-# Install rustup and stable toolchain
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-EORUN
+RUN dnf -y install cargo openssl-devel
 
-# Copy source and build
+# Copy source
 COPY . .
-RUN <<EORUN
+
+# Fetch dependencies with network, cache cargo registry
+RUN --mount=type=cache,target=/root/.cargo/registry cargo fetch
+
+# Build with cached target directory; --frozen ensures lockfile isn't modified
+RUN --mount=type=cache,target=/root/.cargo/registry --mount=type=cache,target=/src/target <<EORUN
 set -xeuo pipefail
-source $HOME/.cargo/env
-cargo build --release --locked
+cargo build --release --frozen
 mkdir -p /out/usr/bin
-install -m 0755 target/release/service-gator /out/usr/bin/
+# Copy from cache mount to output
+cp target/release/service-gator /out/usr/bin/
+chmod 0755 /out/usr/bin/service-gator
 EORUN
 
 # Download CLI tools that service-gator wraps (not available in UBI)
