@@ -16,7 +16,15 @@
 //! Tokens can self-rotate (refresh) by calling POST /token/rotate with a new
 //! expiration time. The new token has identical scopes. This is bounded by
 //! `max_exp_delta` to prevent infinite token lifetimes.
+//!
+//! # Secret/Token File Support
+//!
+//! Secrets can be read from files for container deployments:
+//! - Set `SERVICE_GATOR_SECRET_FILE` or `SERVICE_GATOR_ADMIN_KEY_FILE` to a path
+//! - Compatible with `podman run --secret` and Kubernetes secrets
+//! - Files are read and trimmed of whitespace
 
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
@@ -296,6 +304,38 @@ pub struct ServerConfig {
     pub scopes: ScopeConfig,
 }
 
+/// Read a secret from a file, trimming whitespace.
+///
+/// Used for container secret mounts (podman --secret, k8s secrets).
+fn read_secret_file(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Get a value from env var, or from a file specified by `{VAR}_FILE`.
+///
+/// This supports container secret patterns:
+/// - `podman run --secret gh_token,target=/run/secrets/gh_token`
+/// - Kubernetes secret volume mounts
+fn env_or_file(var_name: &str) -> Option<String> {
+    // First check direct env var
+    if let Ok(val) = std::env::var(var_name) {
+        if !val.is_empty() {
+            return Some(val);
+        }
+    }
+
+    // Then check {VAR}_FILE for a path to read from
+    let file_var = format!("{}_FILE", var_name);
+    if let Ok(path) = std::env::var(&file_var) {
+        return read_secret_file(Path::new(&path));
+    }
+
+    None
+}
+
 impl ServerConfig {
     /// Create a ServerConfig with just scopes (no auth), for backward compatibility.
     pub fn from_scopes(scopes: ScopeConfig) -> Self {
@@ -310,20 +350,30 @@ impl ServerConfig {
         self.server.secret.is_some() && self.server.mode != AuthMode::None
     }
 
-    /// Get the effective secret, checking environment variable as fallback.
+    /// Get the effective secret, checking environment variable and file as fallback.
+    ///
+    /// Order of precedence:
+    /// 1. Config file `server.secret`
+    /// 2. `SERVICE_GATOR_SECRET` environment variable
+    /// 3. File path from `SERVICE_GATOR_SECRET_FILE` environment variable
     pub fn effective_secret(&self) -> Option<String> {
         self.server
             .secret
             .clone()
-            .or_else(|| std::env::var("SERVICE_GATOR_SECRET").ok())
+            .or_else(|| env_or_file("SERVICE_GATOR_SECRET"))
     }
 
-    /// Get the effective admin key, checking environment variable as fallback.
+    /// Get the effective admin key, checking environment variable and file as fallback.
+    ///
+    /// Order of precedence:
+    /// 1. Config file `server.admin-key`
+    /// 2. `SERVICE_GATOR_ADMIN_KEY` environment variable
+    /// 3. File path from `SERVICE_GATOR_ADMIN_KEY_FILE` environment variable
     pub fn effective_admin_key(&self) -> Option<String> {
         self.server
             .admin_key
             .clone()
-            .or_else(|| std::env::var("SERVICE_GATOR_ADMIN_KEY").ok())
+            .or_else(|| env_or_file("SERVICE_GATOR_ADMIN_KEY"))
     }
 }
 

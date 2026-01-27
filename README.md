@@ -4,7 +4,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that p
 
 ## Overview
 
-service-gator is an MCP server that exposes tools for interacting with GitHub, GitLab, Forgejo/Gitea, JIRA, and other services while enforcing fine-grained access control. It's designed for sandboxed AI agents that need controlled access to services where PAT/token-based authentication grants overly broad privileges.
+service-gator is an MCP server that exposes tools for interacting with GitHub, GitLab, Forgejo/Gitea, and JIRA while enforcing fine-grained access control. It's designed for sandboxed AI agents that need controlled access to services where PAT/token-based authentication grants overly broad privileges.
 
 ### The Problem
 
@@ -13,69 +13,21 @@ Personal access tokens are difficult to manage securely for AI agents:
 - **JIRA** PATs grant *all* privileges of the human user with no scoping
 - **GitHub** PATs offer some scoping, but as the [github-mcp-server docs note](https://github.com/github/github-mcp-server?tab=readme-ov-file#token-security-best-practices): tokens are static, easily over-privileged, and you can't scope a token to specific repositories at creation time
 
-For agentic AI workloads, we need fine-grained and *dynamic* credential scoping that tokens alone cannot provide.
-
 ### The Solution
 
-service-gator runs **outside** the AI agent's sandbox as an MCP server. The agent connects via MCP protocol and can only perform operations allowed by your scope configuration—even though the underlying CLI tools have full access via their tokens.
-
-### MCP Tools
-
-The server exposes the following tools:
-
-| Tool | Description |
-|------|-------------|
-| `gh` | Execute GitHub REST API commands (read-only `gh api <endpoint> [--jq]`) |
-| `gh_pending_review` | Create, update, and delete pending PR reviews (for AI code review workflows) |
-| `gl` | Execute GitLab REST API commands (read-only `glab api <endpoint> [--jq]`) |
-| `forgejo` | Execute Forgejo/Gitea REST API commands (read-only, wraps `tea`) |
-| `jira` | Execute JIRA CLI commands within configured scopes |
-
-### Key Features
-
-- **Scope-based access control**: Define which repositories/projects an agent can access
-- **Fine-grained permissions**: Separate read, create-draft, pending-review, and write permissions
-- **Resource-level grants**: Grant write access to specific PRs/issues dynamically
-- **Security boundary**: Agent cannot bypass restrictions—it must go through the MCP server
-
-## Installation
-
-The recommended way to run service-gator is via the container image, which includes all required CLI tools (`gh`, `glab`, `tea`):
-
-```bash
-podman pull ghcr.io/cgwalters/service-gator:latest
-```
-
-Alternatively, build from source (requires `gh`, `glab`, and `tea` to be installed separately):
-
-```bash
-cargo install service-gator
-# or
-git clone https://github.com/cgwalters/service-gator
-cd service-gator
-cargo build --release
-```
+service-gator runs **outside** the AI agent's sandbox as an MCP server. The agent connects via MCP protocol and can only perform operations allowed by the scope configuration—even though the underlying CLI tools have full access via their tokens.
 
 ## Quick Start
 
-### 1. Configure credentials (on the host, NOT in the sandbox)
-
-```bash
-export GH_TOKEN="ghp_xxxxxxxxxxxx"         # GitHub personal access token
-export GITLAB_TOKEN="glpat_xxxxxxxxxxxx"   # GitLab personal access token (for glab)
-export FORGEJO_TOKEN="xxxxxxxxxxxx"        # Forgejo/Gitea token (for tea)
-export JIRA_API_TOKEN="xxxxxxxxxx"         # JIRA API token (for jirust-cli)
-```
-
-### 2. Start the MCP server
-
-Using the container image (recommended):
+The recommended deployment is the container image with CLI-based scope configuration:
 
 ```bash
 # Single repo with read access
-podman run --rm -e GH_TOKEN \
+podman run --rm -p 8080:8080 \
+  -e GH_TOKEN \
   ghcr.io/cgwalters/service-gator:latest \
-  --mcp-server 0.0.0.0:8080 --gh-repo myorg/myrepo:read
+  --mcp-server 0.0.0.0:8080 \
+  --gh-repo myorg/myrepo:read
 
 # Multiple repos with different permissions
 podman run --rm -p 8080:8080 \
@@ -87,294 +39,164 @@ podman run --rm -p 8080:8080 \
   --jira-project MYPROJ:read
 ```
 
-Or using the binary directly:
+The agent (running in a sandbox) connects to `http://host-ip:8080/mcp` using the MCP protocol.
 
-```bash
-# Single repo with read access
-GH_TOKEN="ghp_xxx" service-gator --mcp-server 127.0.0.1:8080 \
-  --gh-repo myorg/myrepo:read
-
-# Multiple repos with different permissions
-service-gator --mcp-server 127.0.0.1:8080 \
-  --gh-repo myorg/myrepo:read,create-draft \
-  --gh-repo myorg/other:read \
-  --jira-project MYPROJ:read
-```
-
-Credentials are passed via environment variables (`GH_TOKEN`, `JIRA_API_TOKEN`)—either exported beforehand or inline as shown above.
-
-For complex configurations, use a config file (see [Configuration](#configuration) below).
-
-### 3. Connect your AI agent
-
-The agent (running in a sandbox) connects to `http://host-ip:8080/mcp` using the MCP protocol. It can only perform operations allowed by your scope config.
-
-**Security note**: The MCP server must run **outside** the sandbox. Running service-gator inside the sandbox provides no security benefit since the agent could simply run `gh` or `jirust-cli` directly.
-
-### Inline Configuration Options
+### CLI Options
 
 | Flag | Format | Example |
 |------|--------|---------|
 | `--gh-repo` | `OWNER/REPO:PERMS` | `--gh-repo myorg/repo:read,create-draft` |
 | `--gitlab-project` | `GROUP/PROJECT:PERMS` | `--gitlab-project mygroup/project:read` |
 | `--gitlab-host` | `HOSTNAME` | `--gitlab-host gitlab.example.com` |
-| `--forgejo-host` | `HOSTNAME` | `--forgejo-host codeberg.org` (required) |
-| `--forgejo-repo` | `OWNER/REPO:PERMS` | `--forgejo-repo user/repo:read` |
+| `--forgejo-host` | `HOSTNAME` | `--forgejo-host codeberg.org` |
+| `--forgejo-repo` | `REPO:PERMS` | `--forgejo-repo owner/repo:read` |
 | `--jira-project` | `PROJECT:PERMS` | `--jira-project MYPROJ:read,create` |
 | `--scope` | JSON | `--scope '{"gh":{"repos":{"o/r":{"read":true}}}}'` |
 
-**GitHub permissions**: `read`, `create-draft`, `pending-review`, `write`
+### Permissions
 
-**GitLab permissions**: `read`, `create-draft`, `approve`, `write`
+**GitHub**: `read`, `create-draft`, `pending-review`, `write`
 
-**Forgejo permissions**: `read`, `create-draft`, `pending-review`, `write`
+**GitLab**: `read`, `create-draft`, `approve`, `write`
 
-**JIRA permissions**: `read`, `create`, `write`
+**Forgejo**: `read`, `create-draft`, `pending-review`, `write`
 
-Inline options are merged with the config file (inline takes precedence).
+**JIRA**: `read`, `create`, `write`
 
-## Configuration
+## Container Secrets (Recommended)
 
-Create `~/.config/service-gator.toml`:
+**Use `podman secret` instead of `-e GH_TOKEN`** for production deployments:
 
-```toml
-# GitHub repository permissions
-[gh.repos]
-# Read-only access to all repos under an owner
-"owner/*" = { read = true }
+- Secrets don't appear in `podman inspect` or process listings
+- Secrets are stored encrypted by podman
+- Secrets can be managed separately from container configuration
 
-# Read + create draft PRs for a specific repo
-"owner/repo" = { read = true, create-draft = true }
+service-gator reads `*_FILE` environment variables at startup and exports them to the environment for child processes.
 
-# Read + manage pending PR reviews (for AI code review)
-"owner/reviewed-repo" = { read = true, pending-review = true }
+### Podman
 
-# Full write access
-"owner/trusted-repo" = { read = true, create-draft = true, pending-review = true, write = true }
+```bash
+# Create secrets (one-time setup)
+echo -n "ghp_xxxx" | podman secret create gh_token -
+echo -n "my-jwt-secret" | podman secret create sg_secret -
 
-# PR-specific grants (typically set dynamically)
-[gh.prs]
-"owner/repo#42" = { read = true, write = true }
-
-# JIRA project permissions
-[jira.projects]
-"MYPROJ" = { read = true, create = true }
-"OTHER" = { read = true }
-
-# JIRA issue-specific grants
-[jira.issues]
-"MYPROJ-123" = { read = true, write = true }
-
-# GitLab project permissions
-[gitlab.projects]
-"mygroup/*" = { read = true }
-"mygroup/myproject" = { read = true, create-draft = true, approve = true }
-
-# GitLab MR-specific grants (use ! separator)
-[gitlab.mrs]
-"mygroup/myproject!42" = { read = true, write = true }
-
-# Optional: self-hosted GitLab
-[gitlab]
-host = "gitlab.example.com"
-
-# Forgejo/Gitea (multiple instances supported via [[forgejo]] array)
-[[forgejo]]
-host = "codeberg.org"
-
-[forgejo.repos]
-"myuser/myrepo" = { read = true, create-draft = true }
-
-[[forgejo]]
-host = "git.example.com"
-
-[forgejo.repos]
-"team/*" = { read = true, write = true }
+# Run with secrets
+podman run --rm -p 8080:8080 \
+  --secret gh_token \
+  --secret sg_secret \
+  -e GH_TOKEN_FILE=/run/secrets/gh_token \
+  -e SERVICE_GATOR_SECRET_FILE=/run/secrets/sg_secret \
+  ghcr.io/cgwalters/service-gator:latest \
+  --mcp-server 0.0.0.0:8080 \
+  --gh-repo myorg/myrepo:read
 ```
 
-### Permission Levels
+Supported `*_FILE` variables: `GH_TOKEN_FILE`, `GITLAB_TOKEN_FILE`, `FORGEJO_TOKEN_FILE`, `JIRA_API_TOKEN_FILE`, `SERVICE_GATOR_SECRET_FILE`, `SERVICE_GATOR_ADMIN_KEY_FILE`
 
-**GitHub (`gh`):**
-- `read`: View PRs, issues, code, run status, etc.
-- `create-draft`: Create draft PRs only (safer for review workflows)
-- `pending-review`: Create, update, and delete pending PR reviews (see below)
-- `write`: Full access (merge, close, create non-draft PRs, etc.)
+### Kubernetes
 
-**GitLab (`gl`):**
-- `read`: View MRs, issues, code, pipelines, etc.
-- `create-draft`: Create draft/WIP MRs only
-- `approve`: Approve/unapprove MRs
-- `write`: Full access (merge, close, create non-draft MRs, etc.)
-
-**Forgejo/Gitea (`forgejo`):**
-- `read`: View PRs, issues, code, etc.
-- `create-draft`: Create draft PRs only
-- `pending-review`: Create and manage pending PR reviews
-- `write`: Full access
-
-**JIRA (`jira`):**
-- `read`: View issues, projects, search
-- `create`: Create new issues
-- `write`: Full access (update, transition, comment, etc.)
-
-### Pattern Matching
-
-Repository patterns support trailing wildcards:
-- `owner/repo`: Exact match
-- `owner/*`: All repos under `owner`
-
-More specific patterns take precedence over wildcards.
-
-## Tool Reference
-
-### `gh` — GitHub REST API
-
-Wraps the [GitHub CLI](https://cli.github.com/). Provides read-only access to the GitHub REST API.
-
-- Only `gh api <endpoint>` is supported
-- All requests forced to GET method (read-only)
-- Only `--jq` option allowed for filtering output
-- Repository extracted from API path (e.g., `/repos/owner/repo/...`)
-
-### `gh_pending_review` — Pending PR Reviews
-
-A tool for AI agents to create code reviews that require human approval before publishing.
-
-**Operations:**
-- **Create**: Creates a review in PENDING state with inline comments
-- **Update**: Modify the review body (only pending reviews)
-- **Delete**: Remove a pending review before submission
-- **List/Get**: View existing reviews
-
-**Security features:**
-
-1. **Marker token**: All reviews include a marker comment (`<!-- service-gator-review -->`). The agent can only update/delete reviews containing this marker, preventing manipulation of human-created reviews.
-
-2. **Pending state only**: Reviews are always created in PENDING state. The agent cannot submit (approve/request changes)—a human must review and submit via the GitHub UI.
-
-3. **No submit/dismiss**: The `/events` and `/dismissals` endpoints are blocked.
-
-Designed for workflows like [perform-forge-review](https://github.com/bootc-dev/agent-skills) where an AI agent prepares a code review for human approval.
-
-### `gl` — GitLab REST API
-
-Wraps the [GitLab CLI (glab)](https://gitlab.com/gitlab-org/cli). Provides read-only access to the GitLab REST API.
-
-- Only `glab api <endpoint>` is supported
-- All requests forced to GET method (read-only)
-- Only `--jq` option allowed for filtering output
-- Project extracted from API path (e.g., `/projects/group%2Fproject/...`)
-- Supports self-hosted GitLab via `--gitlab-host` or config
-
-### `forgejo` — Forgejo/Gitea REST API
-
-Wraps the [tea CLI](https://gitea.com/gitea/tea). Provides read-only access to Forgejo and Gitea instances.
-
-- Only `tea api <endpoint>` is supported
-- All requests forced to GET method (read-only)
-- Repository extracted from API path (e.g., `/api/v1/repos/owner/repo/...`)
-- Supports multiple Forgejo/Gitea hosts
-
-### `jira` — JIRA CLI
-
-Wraps [jirust-cli](https://github.com/ilpianista/jirust-cli). Provides project-scoped access to JIRA.
-
-- Project-based access control
-- Issue key parsing (e.g., `PROJ-123`)
-- Command classification for all major operations
-
-## Token Authentication (Experimental)
-
-service-gator supports JWT-based token authentication for multi-tenant deployments. Instead of configuring scopes at server startup, scopes can be embedded in signed tokens that agents present via Bearer authentication.
-
-### Use Case
-
-A single service-gator instance can serve multiple sandboxed agents, each with their own scope-restricted access:
-
-1. Human/admin mints a scoped token for an agent
-2. Token is passed to the sandbox environment
-3. Agent uses the token for authentication
-4. Token can be rotated (refreshed) without admin intervention
-
-### Configuration
-
-Add auth settings to your config file:
-
-```toml
-[server]
-# Secret key for JWT signing (required for token auth)
-# Can also use SERVICE_GATOR_SECRET env var
-secret = "your-256-bit-secret-key-here"
-
-# Admin key for /admin/* endpoints
-# Can also use SERVICE_GATOR_ADMIN_KEY env var
-admin-key = "admin-secret-for-minting"
-
-# Auth mode: "required", "optional", or "none"
-mode = "required"
-
-[server.rotation]
-enabled = true           # Allow token self-rotation (default: true)
-max-lifetime = 86400     # Max token lifetime in seconds (optional)
-
-# Default scopes (used when auth is "optional" and no token provided)
-[gh.repos]
-"owner/repo" = { read = true }
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: service-gator
+spec:
+  containers:
+  - name: service-gator
+    image: ghcr.io/cgwalters/service-gator:latest
+    args:
+    - --mcp-server
+    - 0.0.0.0:8080
+    - --gh-repo
+    - myorg/myrepo:read
+    ports:
+    - containerPort: 8080
+    env:
+    - name: GH_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: service-gator-secrets
+          key: gh-token
+    - name: SERVICE_GATOR_SECRET
+      valueFrom:
+        secretKeyRef:
+          name: service-gator-secrets
+          key: jwt-secret
+    - name: SERVICE_GATOR_ADMIN_KEY
+      valueFrom:
+        secretKeyRef:
+          name: service-gator-secrets
+          key: admin-key
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: service-gator-secrets
+type: Opaque
+stringData:
+  gh-token: "ghp_xxxx"
+  jwt-secret: "your-256-bit-secret"
+  admin-key: "your-admin-key"
 ```
 
-### API Endpoints
+## Multi-Tenant Deployment with JWT Tokens
 
-#### POST /admin/mint-token
+For multi-tenant deployments, use JWT tokens to provide per-agent scoping. A single service-gator instance can serve multiple agents, each with different access:
 
-Create a new scoped token. Requires `X-Admin-Key` header.
-
-**Request:**
-```json
-{
-  "scopes": {
-    "gh": { "repos": { "owner/repo": { "read": true } } }
-  },
-  "expires-in": 3600,
-  "sub": "agent-123"
-}
+```bash
+# Start server with JWT auth enabled
+podman run --rm -p 8080:8080 \
+  -e GH_TOKEN \
+  -e SERVICE_GATOR_SECRET="your-256-bit-secret" \
+  -e SERVICE_GATOR_ADMIN_KEY="admin-secret" \
+  ghcr.io/cgwalters/service-gator:latest \
+  --mcp-server 0.0.0.0:8080 \
+  --scope '{"server":{"mode":"required"}}'
 ```
 
-**Response:**
-```json
-{
-  "token": "eyJhbG...",
-  "expires-at": 1706283600
-}
+### Mint a Token
+
+```bash
+curl -X POST http://localhost:8080/admin/mint-token \
+  -H "Content-Type: application/json" \
+  -H "X-Admin-Key: admin-secret" \
+  -d '{
+    "scopes": {
+      "gh": { "repos": { "myorg/myrepo": { "read": true } } }
+    },
+    "expires-in": 3600
+  }'
+# Returns: {"token": "eyJhbG...", "expires-at": 1706283600}
 ```
 
-#### POST /token/rotate
+### Use the Token
 
-Refresh a token with a new expiration. Requires valid `Authorization: Bearer <token>` header.
+The agent includes the token in MCP requests:
 
-**Request:**
-```json
-{
-  "expires-in": 3600
-}
+```
+Authorization: Bearer eyJhbG...
 ```
 
-**Response:**
-```json
-{
-  "token": "eyJhbG...",
-  "expires-at": 1706287200
-}
+### Token Rotation
+
+Tokens can self-rotate (refresh) without admin intervention:
+
+```bash
+curl -X POST http://localhost:8080/token/rotate \
+  -H "Authorization: Bearer eyJhbG..." \
+  -H "Content-Type: application/json" \
+  -d '{"expires-in": 3600}'
 ```
 
-**Constraints:**
-- Token must have `can_rotate: true` (default)
-- New expiration cannot exceed `original_iat + max_exp_delta`
-- Rotated token has identical scopes to the original
+## MCP Tools
 
-### Current Limitations
-
-- MCP requests currently use the default scopes from server config, not token scopes
-- Token-based scope enforcement for MCP is planned for a future release
+| Tool | Description |
+|------|-------------|
+| `gh` | GitHub REST API (read-only `gh api <endpoint> [--jq]`) |
+| `gh_pending_review` | Pending PR reviews for AI code review workflows |
+| `gl` | GitLab REST API (read-only `glab api <endpoint> [--jq]`) |
+| `forgejo` | Forgejo/Gitea REST API (read-only, wraps `tea`) |
+| `jira` | JIRA CLI within configured scopes |
 
 ## Security Model
 
@@ -385,35 +207,66 @@ flowchart TB
     end
 
     subgraph host["Host System (trusted)"]
-        daemon["service-gator<br/>MCP Server<br/>(scope config)"]
-        cli["gh / jirust-cli"]
-        creds["GH_TOKEN<br/>JIRA_API_TOKEN"]
-        daemon --> cli
+        gator["service-gator<br/>(scope enforcement)"]
+        cli["gh / glab / tea / jira<br/>(full access)"]
+        creds["GH_TOKEN, etc."]
+        
+        gator --> cli
         creds -.-> cli
     end
 
-    agent -->|"MCP Protocol"| daemon
+    agent -->|"MCP Protocol"| gator
 ```
 
-The MCP server creates a security boundary. The sandboxed agent:
-- Cannot access the host filesystem (no config file tampering)
-- Cannot read environment variables (no credential theft)
-- Cannot execute arbitrary binaries (no bypassing service-gator)
+The sandboxed agent:
+- Cannot access the host filesystem
+- Cannot read environment variables containing credentials
+- Cannot execute arbitrary binaries
+- Must go through service-gator which enforces scope restrictions
 
-All requests go through the MCP server which enforces scope restrictions before invoking the underlying CLI tools.
+## Configuration File (Optional)
+
+For complex configurations, create `~/.config/service-gator.toml`:
+
+```toml
+[gh.repos]
+"owner/*" = { read = true }
+"owner/repo" = { read = true, create-draft = true }
+
+[jira.projects]
+"MYPROJ" = { read = true, create = true }
+
+[gitlab.projects]
+"mygroup/*" = { read = true }
+
+[[forgejo]]
+host = "codeberg.org"
+
+[forgejo.repos]
+"user/repo" = { read = true }
+```
+
+CLI options are merged with (and take precedence over) the config file.
+
+## Installation
+
+### Container (recommended)
+
+```bash
+podman pull ghcr.io/cgwalters/service-gator:latest
+```
+
+### From source
+
+```bash
+cargo install service-gator
+```
+
+Requires `gh`, `glab`, and `tea` to be installed separately.
 
 ## License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
-
-## Roadmap
-
-See [docs/todo.md](docs/todo.md) for planned features and improvements.
+Licensed under either Apache License 2.0 or MIT license, at your option.
 
 ## Contributing
 

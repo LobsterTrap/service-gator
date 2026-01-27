@@ -7,6 +7,7 @@
 //! MCP server mode:
 //!   service-gator --mcp-server 127.0.0.1:8080
 
+use std::path::Path;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -133,6 +134,11 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    // Process *_FILE environment variables before anything else.
+    // This allows secrets to be mounted as files (podman --secret, k8s secrets)
+    // and exported to the environment for child processes (gh, glab, tea, etc.).
+    init_secrets_from_files();
+
     init_tracing();
 
     match try_main() {
@@ -142,6 +148,39 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Read secrets from files specified by *_FILE environment variables.
+///
+/// For each VAR_FILE env var, reads the file and sets VAR to its contents.
+/// This supports container secret patterns like `podman run --secret`.
+fn init_secrets_from_files() {
+    const SECRET_VARS: &[&str] = &[
+        "GH_TOKEN",
+        "GITLAB_TOKEN",
+        "FORGEJO_TOKEN",
+        "GITEA_TOKEN",
+        "JIRA_API_TOKEN",
+        "SERVICE_GATOR_SECRET",
+        "SERVICE_GATOR_ADMIN_KEY",
+    ];
+
+    for var in SECRET_VARS {
+        let file_var = format!("{}_FILE", var);
+        if let Ok(path) = std::env::var(&file_var) {
+            if let Some(value) = read_secret_file(Path::new(&path)) {
+                std::env::set_var(var, value);
+            }
+        }
+    }
+}
+
+/// Read a secret from a file, trimming whitespace.
+fn read_secret_file(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn try_main() -> Result<ExitCode> {
