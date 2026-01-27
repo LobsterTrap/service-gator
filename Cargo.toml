@@ -4,6 +4,7 @@ members = [".", "integration-tests"]
 [workspace.lints.rust]
 unsafe_code = "deny"
 unused_must_use = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [workspace.dependencies]
 eyre = "0.6.12"
@@ -46,6 +47,7 @@ graphql-parser = "0.4"
 
 [dev-dependencies]
 itertools = "0.14"
+kani-verifier = "0.67"
 
 [lints]
 workspace = true

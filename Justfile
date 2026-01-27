@@ -35,9 +35,9 @@ validate:
     cargo fmt -- --check
     cargo clippy -- -D warnings
 
-# Run all CI checks locally (validate + test)
+# Matches default GHA run
 [group('core')]
-ci: validate build test
+ci: validate build test kani
     @echo "All CI checks passed!"
 
 # ============================================================================
@@ -157,3 +157,47 @@ container-test: container-build
 [group('container')]
 container-push tag="latest": container-build
     podman push {{ CONTAINER_IMAGE }}:{{ tag }}
+
+# ============================================================================
+# Formal verification with Kani
+# ============================================================================
+# 
+# Kani provides mathematical certainty about core properties by testing ALL 
+# possible input combinations. The permission hierarchy proof found and helped 
+# fix a real security bug in the access control logic.
+#
+# Commands:
+#   just kani                    - Run Kani formal verification
+#   just kani-proof <name>       - Run specific proof by name
+#   just kani-list               - List available proofs
+#   just kani-check              - Verify Kani installation
+
+# Run Kani formal verification
+[group('verify')]
+kani:
+    cargo kani --harness verify_permission_hierarchy_invariants
+
+# Run specific Kani proof by function name
+[group('verify')]
+kani-proof PROOF_NAME:
+    cargo kani --harness {{ PROOF_NAME }}
+
+# List all available Kani proofs (grep for #[kani::proof])
+[group('verify')]
+kani-list:
+    #!/usr/bin/env bash
+    echo "Available Kani proofs:"
+    grep -r "#\[kani::proof\]" src/ -A 1 | grep "fn " | sed 's/.*fn /- /' | sed 's/(.*//'
+
+# Check Kani setup
+[group('verify')]
+kani-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Checking Kani installation..."
+    if ! command -v cargo-kani &> /dev/null; then
+        echo "Error: cargo-kani not found. Install with: cargo install --locked kani-verifier"
+        exit 1
+    fi
+    cargo kani --version
+    echo "Kani is ready!"

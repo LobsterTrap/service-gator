@@ -67,8 +67,9 @@ impl GhRepoPermission {
     }
 
     /// Check if reads are allowed.
+    /// Any capability (create_draft, pending_review, write) implies read access.
     pub fn can_read(&self) -> bool {
-        self.read || self.write
+        self.read || self.create_draft || self.pending_review || self.write
     }
 
     /// Check if creating draft PRs is allowed.
@@ -435,11 +436,12 @@ impl GlProjectPermission {
     }
 
     /// Check if reads are allowed.
+    /// Any capability (create_draft, approve, write) implies read access.
     pub fn can_read(&self) -> bool {
-        self.read || self.write
+        self.read || self.create_draft || self.approve || self.write
     }
 
-    /// Check if creating draft MRs is allowed.
+    /// Check if creating draft PRs is allowed.
     pub fn can_create_draft(&self) -> bool {
         self.create_draft || self.write
     }
@@ -1653,5 +1655,56 @@ mod tests {
 
         let config: ScopeConfig = toml::from_str(toml).unwrap();
         assert!(config.forgejo.is_empty());
+    }
+}
+
+// ============================================================================
+// Kani Formal Verification Proofs
+// ============================================================================
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// Verify permission hierarchy invariants for all possible permission combinations
+    /// This proof found a real bug in the original logic!
+    #[kani::proof]
+    fn verify_permission_hierarchy_invariants() {
+        let read: bool = kani::any();
+        let create_draft: bool = kani::any();
+        let pending_review: bool = kani::any();
+        let write: bool = kani::any();
+
+        let perm = GhRepoPermission {
+            read,
+            create_draft,
+            pending_review,
+            write,
+        };
+
+        // Property 1: write permission implies all others
+        if perm.write {
+            assert!(perm.can_read(), "Write permission should imply read");
+            assert!(
+                perm.can_create_draft(),
+                "Write permission should imply create_draft"
+            );
+            assert!(
+                perm.can_manage_pending_review(),
+                "Write permission should imply pending_review"
+            );
+        }
+
+        // Property 2: any capability should imply read access
+        if perm.can_create_draft() || perm.can_manage_pending_review() || perm.can_write() {
+            assert!(perm.can_read(), "Any capability should imply read access");
+        }
+
+        // Property 3: verify the corrected can_read() logic
+        assert_eq!(
+            perm.can_read(),
+            perm.read || perm.create_draft || perm.pending_review || perm.write,
+            "can_read should match any capability"
+        );
     }
 }
