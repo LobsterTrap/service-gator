@@ -35,9 +35,9 @@ validate:
     cargo fmt -- --check
     cargo clippy -- -D warnings
 
-# Run all CI checks locally (validate + test)
+# Matches default GHA run
 [group('core')]
-ci: validate build test
+ci: validate build test kani
     @echo "All CI checks passed!"
 
 # ============================================================================
