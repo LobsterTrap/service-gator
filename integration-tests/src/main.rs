@@ -22,6 +22,7 @@ mod tests {
     pub mod jira;
     pub mod mcp_server;
     pub mod rmcp_client;
+    pub mod status_tests;
 }
 
 /// Get the path to the service-gator binary
