@@ -130,6 +130,12 @@ pub struct ReviewComment {
     pub body: String,
 }
 
+/// Input schema for overall status command.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct StatusToolInput {
+    // No parameters needed for overall status
+}
+
 /// Resolved scopes for a request.
 ///
 /// This is injected into HTTP request extensions by the auth middleware, containing
@@ -296,9 +302,9 @@ impl ServiceGatorServer {
 #[tool_router]
 impl ServiceGatorServer {
     /// Execute a GitHub API command within configured scopes.
-    /// Only `gh api` is supported for read-only access.
+    /// Operations are restricted by scope permissions (read, draft-pr, pending-review, write).
     #[tool(
-        description = "Execute GitHub API commands (read-only). Only 'gh api <endpoint> [--jq <expr>]' is supported."
+        description = "Execute GitHub API commands within configured scope permissions. Use 'gh api <endpoint> [--jq <expr>]' for API access. Write operations (draft PRs, pending reviews) available if permitted by scope. Use the 'status' tool to view current capabilities."
     )]
     async fn gh(
         &self,
@@ -312,7 +318,7 @@ impl ServiceGatorServer {
         let first_arg = args.first().map(|s| s.as_str());
         if first_arg != Some("api") {
             return Ok(CallToolResult::error(vec![Content::text(
-                "Only `gh api` is supported. Use `gh api repos/OWNER/REPO/...` to access the REST API.",
+                "Only `gh api` is supported. Use `gh api repos/OWNER/REPO/...` to access the REST API. For capability information, use the 'status' tool.",
             )]));
         }
 
@@ -371,9 +377,9 @@ impl ServiceGatorServer {
     }
 
     /// Execute a GitLab API command within configured scopes.
-    /// Only `glab api` is supported for read-only access.
+    /// Operations are restricted by scope permissions (read, draft-mr, approve, write).
     #[tool(
-        description = "Execute GitLab API commands (read-only). Only 'glab api <endpoint> [--jq <expr>]' is supported."
+        description = "Execute GitLab API commands within configured scope permissions. Use 'glab api <endpoint> [--jq <expr>]' for API access. Write operations (draft MRs, approvals) available if permitted by scope. Use the 'status' tool to view current capabilities."
     )]
     async fn gl(
         &self,
@@ -387,7 +393,7 @@ impl ServiceGatorServer {
         let first_arg = args.first().map(|s| s.as_str());
         if first_arg != Some("api") {
             return Ok(CallToolResult::error(vec![Content::text(
-                "Only `glab api` is supported. Use `glab api projects/GROUP%2FPROJECT/...` to access the REST API.",
+                "Only `glab api` is supported. Use `glab api projects/GROUP%2FPROJECT/...` to access the REST API. For capability information, use the 'status' tool.",
             )]));
         }
 
@@ -435,9 +441,9 @@ impl ServiceGatorServer {
     }
 
     /// Execute a Forgejo API command within configured scopes.
-    /// Only `api` is supported for read-only access.
+    /// Operations are restricted by scope permissions (read, draft-pr, pending-review, write).
     #[tool(
-        description = "Execute Forgejo/Gitea API commands (read-only). Only 'api <endpoint>' is supported. For Codeberg, use host 'codeberg.org'."
+        description = "Execute Forgejo/Gitea API commands within configured scope permissions. Use 'api <endpoint>' for API access. Write operations (draft PRs, pending reviews) available if permitted by scope. For Codeberg, use host 'codeberg.org'. Use the 'status' tool to view current capabilities."
     )]
     async fn forgejo(
         &self,
@@ -451,7 +457,7 @@ impl ServiceGatorServer {
         let first_arg = args.first().map(|s| s.as_str());
         if first_arg != Some("api") {
             return Ok(CallToolResult::error(vec![Content::text(
-                "Only `api` is supported. Use `api /api/v1/repos/OWNER/REPO/...` to access the REST API.",
+                "Only `api` is supported. Use `api /api/v1/repos/OWNER/REPO/...` to access the REST API. For capability information, use the 'status' tool.",
             )]));
         }
 
@@ -736,7 +742,7 @@ impl ServiceGatorServer {
     /// Only explicitly allowed commands and options are permitted.
     /// Unknown commands or options are rejected for security.
     #[tool(
-        description = "Execute JIRA commands within configured scopes. Allowed commands: issue (list/show/create/transition/assign), project list, version list, search. Only explicitly allowed options are permitted."
+        description = "Execute JIRA commands within configured scopes. Allowed commands: issue (list/show/create/transition/assign), project list, version list, search. Only explicitly allowed options are permitted. Use the 'status' tool to view current capabilities."
     )]
     async fn jira(
         &self,
@@ -760,7 +766,8 @@ impl ServiceGatorServer {
                      issue assign -i ISSUE-KEY [-a ASSIGNEE]\n  \
                      project list\n  \
                      version list -p PROJECT\n  \
-                     search -q JQL",
+                     search -q JQL\n\n\
+                     For capability information, use the 'status' tool.",
                     e
                 ))]));
             }
@@ -876,6 +883,20 @@ impl ServiceGatorServer {
             ))])),
         }
     }
+
+    /// Get overall status of all services and their authentication.
+    /// Shows which tools are available and which are missing credentials.
+    #[tool(
+        description = "Show overall status of all services including authentication status, available tools, and missing credentials."
+    )]
+    async fn status(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(_input): Parameters<StatusToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let config = get_scopes_from_parts(&parts)?;
+        Ok(generate_overall_status(&config))
+    }
 }
 
 /// Execute a validated JIRA command using the native client.
@@ -972,12 +993,25 @@ impl ServerHandler for ServiceGatorServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "service-gator: Scoped CLI access for AI agents. \
-                 Tools: gh (read-only GitHub API), gl (read-only GitLab API), \
-                 forgejo (read-only Forgejo/Gitea API), \
-                 gh_pending_review (manage pending PR reviews), jira (JIRA CLI). \
-                 All operations are checked against configured scope permissions. \
-                 Pending reviews require a marker token and remain in PENDING state for human review."
+                "service-gator: Scoped CLI access for AI agents with comprehensive capability introspection. \
+                 \
+                 Capability discovery: Use the 'status' tool to get a comprehensive overview of all services: \
+                 - Which services are available vs unavailable \
+                 - Authentication status and missing credentials \
+                 - Detailed permissions for each service (GitHub, GitLab, Forgejo, JIRA) \
+                 - Repository/project access with permission levels \
+                 - Configuration guidance and usage examples \
+                 \
+                 Available tools: \
+                 - status: Overall service availability and authentication status \
+                 - gh: GitHub API access (scope-restricted: read/draft-pr/pending-review/write permissions) \
+                 - gl: GitLab API access (scope-restricted: read/draft-mr/approve/write permissions) \
+                 - forgejo: Forgejo/Gitea API access (scope-restricted: read/draft-pr/pending-review/write permissions) \
+                 - gh_pending_review: GitHub PR review management (requires pending-review permission) \
+                 - jira: JIRA operations (scope-restricted: read/create/write permissions) \
+                 \
+                 Security: All operations are scope-restricted. Each tool operates within its configured permissions. \
+                 Write operations (draft PR/MR creation, pending review management, approvals) require explicit scope permissions."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -986,6 +1020,274 @@ impl ServerHandler for ServiceGatorServer {
     }
 }
 
+/// Generate an overall status report showing all services and their authentication status.
+fn generate_overall_status(config: &ScopeConfig) -> CallToolResult {
+    let mut status_lines = vec![
+        "Service-Gator Overall Status".to_string(),
+        "============================".to_string(),
+        "".to_string(),
+    ];
+
+    // Check each service availability
+    let mut available_services = Vec::new();
+    let mut unavailable_services = Vec::new();
+
+    // GitHub
+    let gh_status = check_github_availability(config);
+    if gh_status.available {
+        available_services.push(("GitHub", gh_status.details));
+    } else {
+        unavailable_services.push(("GitHub", gh_status.details));
+    }
+
+    // GitLab
+    let gl_status = check_gitlab_availability(config);
+    if gl_status.available {
+        available_services.push(("GitLab", gl_status.details));
+    } else {
+        unavailable_services.push(("GitLab", gl_status.details));
+    }
+
+    // Forgejo
+    let forgejo_status = check_forgejo_availability(config);
+    if forgejo_status.available {
+        available_services.push(("Forgejo/Gitea", forgejo_status.details));
+    } else {
+        unavailable_services.push(("Forgejo/Gitea", forgejo_status.details));
+    }
+
+    // JIRA
+    let jira_status = check_jira_availability(config);
+    if jira_status.available {
+        available_services.push(("JIRA", jira_status.details));
+    } else {
+        unavailable_services.push(("JIRA", jira_status.details));
+    }
+
+    // Show available services
+    if !available_services.is_empty() {
+        status_lines.push("Available services:".to_string());
+        for (service, details) in &available_services {
+            status_lines.push(format!("   {} - {}", service, details));
+        }
+        status_lines.push("".to_string());
+    }
+
+    // Show unavailable services
+    if !unavailable_services.is_empty() {
+        status_lines.push("Unavailable services:".to_string());
+        for (service, details) in &unavailable_services {
+            status_lines.push(format!("   {} - {}", service, details));
+        }
+        status_lines.push("".to_string());
+    }
+
+    // Service-specific status commands
+    if !available_services.is_empty() {
+        status_lines.push("Detailed status commands:".to_string());
+        for (service, _) in &available_services {
+            let cmd = match service {
+                s if s.contains("GitHub") => "gh status",
+                s if s.contains("GitLab") => "glab status",
+                s if s.contains("Forgejo") => "status (in forgejo tool)",
+                s if s.contains("JIRA") => "jira status",
+                _ => "status",
+            };
+            status_lines.push(format!("   {} detailed status: {}", service, cmd));
+        }
+        status_lines.push("".to_string());
+    }
+
+    // Configuration guidance
+    if !unavailable_services.is_empty() {
+        status_lines.push("Configuration guidance:".to_string());
+        status_lines.push("   Set these environment variables to enable services:".to_string());
+
+        for (service, _details) in &unavailable_services {
+            if service.contains("GitHub") {
+                status_lines.push("   - GitHub: Authentication token required".to_string());
+            } else if service.contains("GitLab") {
+                status_lines.push("   - GitLab: Authentication token required".to_string());
+            } else if service.contains("Forgejo") {
+                status_lines
+                    .push("   - Forgejo/Gitea: Host configuration and token required".to_string());
+            } else if service.contains("JIRA") {
+                status_lines.push("   - JIRA: Host and API token required".to_string());
+            }
+        }
+    }
+
+    CallToolResult::success(vec![Content::text(status_lines.join("\n"))])
+}
+
+/// Service availability status
+struct ServiceStatus {
+    available: bool,
+    details: String,
+}
+
+/// Check GitHub service availability
+fn check_github_availability(config: &ScopeConfig) -> ServiceStatus {
+    // Check for GH_TOKEN environment variable
+    let has_token = std::env::var("GH_TOKEN").is_ok();
+
+    // Check if any repos are configured
+    let has_repos = !config.gh.repos.is_empty();
+
+    if has_token && has_repos {
+        let repo_count = config.gh.repos.len();
+        ServiceStatus {
+            available: true,
+            details: format!("Authenticated, {} repositories in scope", repo_count),
+        }
+    } else if has_token {
+        ServiceStatus {
+            available: false,
+            details: "Token available but no repositories configured".to_string(),
+        }
+    } else if has_repos {
+        ServiceStatus {
+            available: false,
+            details: "Repositories configured but missing GH_TOKEN".to_string(),
+        }
+    } else {
+        ServiceStatus {
+            available: false,
+            details: "Missing GH_TOKEN and repository configuration".to_string(),
+        }
+    }
+}
+
+/// Check GitLab service availability  
+fn check_gitlab_availability(config: &ScopeConfig) -> ServiceStatus {
+    // Check for GITLAB_TOKEN environment variable
+    let has_token = std::env::var("GITLAB_TOKEN").is_ok();
+
+    // Check if any projects are configured
+    let has_projects = !config.gitlab.projects.is_empty();
+
+    // Check host configuration
+    let host = config.gitlab.host.as_deref().unwrap_or("gitlab.com");
+
+    if has_token && has_projects {
+        let project_count = config.gitlab.projects.len();
+        ServiceStatus {
+            available: true,
+            details: format!(
+                "Authenticated on {}, {} projects in scope",
+                host, project_count
+            ),
+        }
+    } else if has_token {
+        ServiceStatus {
+            available: false,
+            details: "Token available but no projects configured".to_string(),
+        }
+    } else if has_projects {
+        ServiceStatus {
+            available: false,
+            details: "Projects configured but missing GITLAB_TOKEN".to_string(),
+        }
+    } else {
+        ServiceStatus {
+            available: false,
+            details: "Missing GITLAB_TOKEN and project configuration".to_string(),
+        }
+    }
+}
+
+/// Check Forgejo service availability
+fn check_forgejo_availability(config: &ScopeConfig) -> ServiceStatus {
+    // Check for tokens
+    let has_forgejo_token = std::env::var("FORGEJO_TOKEN").is_ok();
+    let has_gitea_token = std::env::var("GITEA_TOKEN").is_ok();
+    let has_token = has_forgejo_token || has_gitea_token;
+
+    // Check if any hosts are configured
+    if config.forgejo.is_empty() {
+        return ServiceStatus {
+            available: false,
+            details: "No Forgejo/Gitea hosts configured".to_string(),
+        };
+    }
+
+    let host_count = config.forgejo.len();
+    let total_repos: usize = config.forgejo.iter().map(|f| f.repos.len()).sum();
+
+    if has_token && total_repos > 0 {
+        let hosts: Vec<_> = config.forgejo.iter().map(|f| f.host.as_str()).collect();
+        ServiceStatus {
+            available: true,
+            details: format!(
+                "Authenticated, {} hosts configured ({}), {} repositories",
+                host_count,
+                hosts.join(", "),
+                total_repos
+            ),
+        }
+    } else if has_token {
+        ServiceStatus {
+            available: false,
+            details: "Token available but no repositories configured".to_string(),
+        }
+    } else {
+        ServiceStatus {
+            available: false,
+            details: "Missing FORGEJO_TOKEN or GITEA_TOKEN".to_string(),
+        }
+    }
+}
+
+/// Check JIRA service availability
+fn check_jira_availability(config: &ScopeConfig) -> ServiceStatus {
+    // Check environment variables
+    let has_host = std::env::var("JIRA_HOST").is_ok() || config.jira.host.is_some();
+    let has_token = std::env::var("JIRA_API_TOKEN").is_ok() || config.jira.token.is_some();
+    let has_username = std::env::var("JIRA_USERNAME").is_ok() || config.jira.username.is_some();
+
+    // Check if any projects are configured
+    let has_projects = !config.jira.projects.is_empty();
+
+    let host_string = config
+        .jira
+        .host
+        .clone()
+        .or_else(|| std::env::var("JIRA_HOST").ok())
+        .unwrap_or_else(|| "not configured".to_string());
+    let host = host_string.as_str();
+
+    if has_host && has_token && has_projects {
+        let project_count = config.jira.projects.len();
+        let auth_method = if has_username {
+            "Basic auth"
+        } else {
+            "Bearer token"
+        };
+        ServiceStatus {
+            available: true,
+            details: format!(
+                "Connected to {} ({}), {} projects in scope",
+                host, auth_method, project_count
+            ),
+        }
+    } else {
+        let mut missing = Vec::new();
+        if !has_host {
+            missing.push("JIRA_HOST");
+        }
+        if !has_token {
+            missing.push("JIRA_API_TOKEN");
+        }
+        if !has_projects {
+            missing.push("project configuration");
+        }
+
+        ServiceStatus {
+            available: false,
+            details: format!("Missing: {}", missing.join(", ")),
+        }
+    }
+}
 /// Find the appropriate ForgejoScope based on the provided host.
 ///
 /// - If only one Forgejo host is configured, use it (host parameter optional)
