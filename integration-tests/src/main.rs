@@ -16,26 +16,31 @@ use tempfile::TempDir;
 // Re-export from lib for internal use
 pub(crate) use integration_tests::INTEGRATION_TESTS;
 
+mod mcp_client;
 mod tests {
     pub mod forgejo;
     pub mod jira;
     pub mod mcp_server;
+    pub mod rmcp_client;
 }
 
 /// Get the path to the service-gator binary
+///
+/// Checks SERVICE_GATOR_PATH env var first, then falls back to "service-gator".
+/// If a binary is detected in target/ directories, forces the user to set the
+/// env var explicitly to avoid confusion about which binary is being tested.
 pub(crate) fn get_service_gator_path() -> Result<PathBuf> {
     // Check for explicit override
     if let Ok(path) = std::env::var("SERVICE_GATOR_PATH") {
         return Ok(PathBuf::from(path));
     }
 
-    // Look for built binary in target directories
+    // Force the user to set this if we're running from the project dir
     let candidates = ["target/release/service-gator", "target/debug/service-gator"];
-    for candidate in candidates {
-        let path = PathBuf::from(candidate);
-        if path.exists() {
-            return Ok(path);
-        }
+    if let Some(path) = candidates.into_iter().find(|p| PathBuf::from(p).exists()) {
+        return Err(eyre::eyre!(
+            "Detected {path} - set SERVICE_GATOR_PATH={path} to run using this binary"
+        ));
     }
 
     // Fall back to assuming it's in PATH

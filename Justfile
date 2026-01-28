@@ -37,7 +37,7 @@ validate:
 
 # Matches default GHA run
 [group('core')]
-ci: validate build test kani
+ci: validate build test kani test-integration
     @echo "All CI checks passed!"
 
 # ============================================================================

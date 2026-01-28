@@ -10,12 +10,25 @@
 //! ```
 //!
 //! The server exposes tools for each configured service (gh, jira, etc.).
+//!
+//! # Token Authentication
+//!
+//! When configured with a secret, the server supports JWT-based authentication:
+//! - `POST /admin/mint-token` - Create new scoped tokens (requires admin key)
+//! - `POST /token/rotate` - Refresh an existing token (requires valid Bearer token)
+//! - `/mcp` - MCP endpoint, requires Bearer token when auth mode is "required"
 
 use std::process::Stdio;
 use std::sync::Arc;
 
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{header, Request, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Json, Response};
 use eyre::Result;
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
 use rmcp::schemars;
@@ -24,10 +37,22 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::RwLock;
 
 use serde::Serialize;
+use subtle::ConstantTimeEq;
 
+use crate::auth::{
+    AuthError, AuthMode, MintError, MintRequest, RotateError, RotateRequest, ServerConfig,
+    TokenAuthority, TokenError,
+};
+
+/// Constant-time byte comparison to prevent timing attacks.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.ct_eq(b).into()
+}
 use crate::forgejo;
 use crate::forgejo_client::{self, ForgejoClient};
 use crate::github::{self, PendingReviewOp, REVIEW_MARKER_TOKEN};
@@ -105,21 +130,56 @@ pub struct ReviewComment {
     pub body: String,
 }
 
+/// Resolved scopes for a request.
+///
+/// This is injected into HTTP request extensions by the auth middleware, containing
+/// either the token's embedded scopes or the server's default scopes.
+/// Handlers extract this from `http::request::Parts` extensions.
+#[derive(Clone)]
+pub struct ResolvedScopes(pub ScopeConfig);
+
+/// Helper to extract resolved scopes from HTTP request parts.
+///
+/// Returns the scopes from the `ResolvedScopes` extension if present,
+/// or returns an internal error if not found. The middleware should always
+/// set this, so failure indicates a configuration or routing issue.
+fn get_scopes_from_parts(parts: &http::request::Parts) -> Result<ScopeConfig, McpError> {
+    parts
+        .extensions
+        .get::<ResolvedScopes>()
+        .map(|r| r.0.clone())
+        .ok_or_else(|| {
+            tracing::error!(
+                "ResolvedScopes not found in request extensions - auth middleware not configured?"
+            );
+            McpError::internal_error("internal server error", None)
+        })
+}
+
 /// The MCP server handler for service-gator.
+///
+/// Scopes are resolved per-request by the auth middleware and injected as
+/// `ResolvedScopes` into request extensions. Handlers extract scopes from there.
 #[derive(Clone)]
 pub struct ServiceGatorServer {
-    config: Arc<RwLock<ScopeConfig>>,
     tool_router: ToolRouter<Self>,
 }
 
 impl ServiceGatorServer {
-    pub fn new(config: ScopeConfig) -> Self {
+    pub fn new() -> Self {
         Self {
-            config: Arc::new(RwLock::new(config)),
             tool_router: Self::tool_router(),
         }
     }
+}
 
+impl Default for ServiceGatorServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ServiceGatorServer {
     /// Execute a command and capture output.
     async fn exec_command(&self, command: &str, args: &[String]) -> Result<String, String> {
         let mut child = Command::new(command)
@@ -242,9 +302,11 @@ impl ServiceGatorServer {
     )]
     async fn gh(
         &self,
+        Extension(parts): Extension<http::request::Parts>,
         Parameters(input): Parameters<GhToolInput>,
     ) -> Result<CallToolResult, McpError> {
         let args = input.args;
+        let config = get_scopes_from_parts(&parts)?;
 
         // Only allow `gh api` subcommand
         let first_arg = args.first().map(|s| s.as_str());
@@ -263,8 +325,6 @@ impl ServiceGatorServer {
                 ))]));
             }
         };
-
-        let config = self.config.read().await;
 
         // Permission check: GraphQL vs REST
         if api.is_graphql {
@@ -293,7 +353,6 @@ impl ServiceGatorServer {
                 ))]));
             }
         }
-        drop(config);
 
         // Build final args with forced GET method
         let final_args = github::build_api_args(&api);
@@ -318,9 +377,11 @@ impl ServiceGatorServer {
     )]
     async fn gl(
         &self,
+        Extension(parts): Extension<http::request::Parts>,
         Parameters(input): Parameters<GlToolInput>,
     ) -> Result<CallToolResult, McpError> {
         let args = input.args;
+        let config = get_scopes_from_parts(&parts)?;
 
         // Only allow `glab api` subcommand
         let first_arg = args.first().map(|s| s.as_str());
@@ -351,7 +412,6 @@ impl ServiceGatorServer {
             }
         };
 
-        let config = self.config.read().await;
         if !config.gitlab.is_read_allowed(project) {
             return Ok(CallToolResult::error(vec![Content::text(format!(
                 "Read access not allowed for project: {project}"
@@ -360,7 +420,6 @@ impl ServiceGatorServer {
 
         // Build final args with forced GET method and optional hostname
         let final_args = gitlab::build_api_args_with_host(&api.args, config.gitlab.host.as_deref());
-        drop(config);
 
         // Execute
         match self.exec_command("glab", &final_args).await {
@@ -382,9 +441,11 @@ impl ServiceGatorServer {
     )]
     async fn forgejo(
         &self,
+        Extension(parts): Extension<http::request::Parts>,
         Parameters(input): Parameters<ForgejoToolInput>,
     ) -> Result<CallToolResult, McpError> {
         let args = input.args;
+        let config = get_scopes_from_parts(&parts)?;
 
         // Only allow `api` subcommand
         let first_arg = args.first().map(|s| s.as_str());
@@ -424,7 +485,6 @@ impl ServiceGatorServer {
         };
 
         // Find the right ForgejoScope by host
-        let config = self.config.read().await;
         let forgejo_scope = match find_forgejo_scope(&config.forgejo, input.host.as_deref()) {
             Ok(scope) => scope,
             Err(e) => {
@@ -441,7 +501,6 @@ impl ServiceGatorServer {
 
         let host = forgejo_scope.host.clone();
         let token = forgejo_scope.token.clone();
-        drop(config);
 
         // Create native Forgejo API client
         let client = match ForgejoClient::new(&host, token.as_deref()) {
@@ -475,10 +534,12 @@ impl ServiceGatorServer {
     )]
     async fn gh_pending_review(
         &self,
+        Extension(parts): Extension<http::request::Parts>,
         Parameters(input): Parameters<PendingReviewInput>,
     ) -> Result<CallToolResult, McpError> {
+        let config = get_scopes_from_parts(&parts)?;
+
         // Check permission
-        let config = self.config.read().await;
         if !config
             .gh
             .is_allowed(&input.repo, GhOpType::ManagePendingReview, None)
@@ -488,7 +549,6 @@ impl ServiceGatorServer {
                 input.repo
             ))]));
         }
-        drop(config);
 
         // Parse operation
         let op = match input.operation.to_lowercase().as_str() {
@@ -680,9 +740,11 @@ impl ServiceGatorServer {
     )]
     async fn jira(
         &self,
+        Extension(parts): Extension<http::request::Parts>,
         Parameters(input): Parameters<JiraToolInput>,
     ) -> Result<CallToolResult, McpError> {
         let args = input.args;
+        let config = get_scopes_from_parts(&parts)?;
 
         // Parse and validate the command using clap - rejects unknown commands/options
         let validated = match jira::parse_command(&args) {
@@ -717,9 +779,6 @@ impl ServiceGatorServer {
             .as_deref()
             .or_else(|| validated.issue.as_ref().and_then(|i| i.split('-').next()))
             .map(|s| s.to_string());
-
-        // Check permission
-        let config = self.config.read().await;
 
         // Verify JIRA is configured
         // Supports either:
@@ -783,7 +842,6 @@ impl ServiceGatorServer {
                 ))]));
             }
         }
-        drop(config);
 
         // Create the JIRA client
         // Use bearer auth if no username, otherwise basic auth
@@ -964,16 +1022,43 @@ fn find_forgejo_scope<'a>(
     }
 }
 
+/// Shared state for the auth endpoints.
+#[derive(Clone)]
+pub struct AppState {
+    /// Token authority for signing/validating JWTs.
+    pub token_authority: Option<Arc<TokenAuthority>>,
+    /// Server configuration.
+    pub config: Arc<ServerConfig>,
+}
+
 /// Start the MCP server on the given address.
+///
+/// This is the legacy entry point that accepts just `ScopeConfig`.
+/// For token auth support, use `start_server_with_config`.
 pub async fn start_server(bind_addr: &str, config: ScopeConfig) -> Result<()> {
+    start_server_with_config(bind_addr, ServerConfig::from_scopes(config)).await
+}
+
+/// Start the MCP server with full configuration including auth.
+pub async fn start_server_with_config(bind_addr: &str, config: ServerConfig) -> Result<()> {
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     };
 
     let ct = tokio_util::sync::CancellationToken::new();
 
-    let service = StreamableHttpService::new(
-        move || Ok(ServiceGatorServer::new(config.clone())),
+    // Create token authority if secret is configured
+    let token_authority = config.effective_secret().map(|secret| {
+        tracing::info!(mode = ?config.server.mode, "Token authentication enabled");
+        Arc::new(TokenAuthority::new(&secret))
+    });
+
+    if token_authority.is_none() && config.server.mode != AuthMode::None {
+        tracing::warn!(mode = ?config.server.mode, "Auth mode set but no secret configured");
+    }
+
+    let mcp_service = StreamableHttpService::new(
+        || Ok(ServiceGatorServer::new()),
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig {
             cancellation_token: ct.child_token(),
@@ -981,10 +1066,32 @@ pub async fn start_server(bind_addr: &str, config: ScopeConfig) -> Result<()> {
         },
     );
 
-    let router = axum::Router::new().nest_service("/mcp", service);
+    let app_state = AppState {
+        token_authority,
+        config: Arc::new(config),
+    };
+
+    // Build the MCP service route with auth middleware
+    // The middleware injects TokenClaims into request extensions for handlers to use
+    let mcp_router = axum::Router::new()
+        .nest_service("/mcp", mcp_service)
+        .layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            auth_middleware,
+        ))
+        .with_state(app_state.clone());
+
+    // Build the router with auth endpoints and MCP service
+    // Note: /admin/mint-token and /token/rotate have their own auth logic
+    let router = axum::Router::new()
+        .route("/admin/mint-token", axum::routing::post(mint_token_handler))
+        .route("/token/rotate", axum::routing::post(rotate_token_handler))
+        .merge(mcp_router)
+        .with_state(app_state);
+
     let tcp_listener = tokio::net::TcpListener::bind(bind_addr).await?;
 
-    eprintln!("service-gator MCP server listening on {}", bind_addr);
+    tracing::info!(address = %bind_addr, "MCP server listening");
 
     axum::serve(tcp_listener, router)
         .with_graceful_shutdown(async move {
@@ -994,4 +1101,262 @@ pub async fn start_server(bind_addr: &str, config: ScopeConfig) -> Result<()> {
         .await?;
 
     Ok(())
+}
+
+/// Handler for POST /admin/mint-token
+async fn mint_token_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<MintRequest>,
+) -> impl IntoResponse {
+    // Check that token auth is enabled
+    let authority = match &state.token_authority {
+        Some(a) => a,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(AuthError::new("token authentication not configured")),
+            )
+                .into_response();
+        }
+    };
+
+    // Validate admin key
+    let expected_admin_key = match state.config.effective_admin_key() {
+        Some(k) => k,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(AuthError::new("admin key not configured")),
+            )
+                .into_response();
+        }
+    };
+
+    let provided_key = headers
+        .get("x-admin-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    // Use constant-time comparison to prevent timing attacks
+    if !constant_time_eq(provided_key.as_bytes(), expected_admin_key.as_bytes()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(AuthError::new("invalid admin key")),
+        )
+            .into_response();
+    }
+
+    // Mint the token
+    match authority.mint(&req, &state.config.server.rotation) {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(MintError::ExpiresTooShort { min }) => (
+            StatusCode::BAD_REQUEST,
+            Json(AuthError::new(format!(
+                "expires_in must be at least {min} seconds"
+            ))),
+        )
+            .into_response(),
+        Err(MintError::ExpiresTooLong { max }) => (
+            StatusCode::BAD_REQUEST,
+            Json(AuthError::new(format!(
+                "expires_in must be at most {max} seconds"
+            ))),
+        )
+            .into_response(),
+        Err(MintError::Signing(_)) => {
+            tracing::error!("Token signing failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(AuthError::new("token creation failed")),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Handler for POST /token/rotate
+async fn rotate_token_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<RotateRequest>,
+) -> impl IntoResponse {
+    // Check that token auth is enabled
+    let authority = match &state.token_authority {
+        Some(a) => a,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(AuthError::new("token authentication not configured")),
+            )
+                .into_response();
+        }
+    };
+
+    // Extract and validate Bearer token
+    let token = match extract_bearer_token(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(AuthError::new("missing or invalid Authorization header")),
+            )
+                .into_response();
+        }
+    };
+
+    let claims = match authority.validate(token) {
+        Ok(c) => c,
+        Err(TokenError::Expired) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(AuthError::new("token has expired")),
+            )
+                .into_response();
+        }
+        Err(TokenError::InvalidSignature) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(AuthError::new("invalid token signature")),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::debug!("Token validation failed during rotation: {e:?}");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(AuthError::new("invalid token")),
+            )
+                .into_response();
+        }
+    };
+
+    // Rotate the token
+    match authority.rotate(&claims, &req) {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(RotateError::RotationDisabled) => (
+            StatusCode::FORBIDDEN,
+            Json(AuthError::new("token rotation not permitted")),
+        )
+            .into_response(),
+        Err(RotateError::ExceedsMaxLifetime { .. }) => (
+            StatusCode::BAD_REQUEST,
+            Json(AuthError::new(
+                "requested expiration exceeds maximum allowed",
+            )),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AuthError::new(e.to_string())),
+        )
+            .into_response(),
+    }
+}
+
+/// Extract Bearer token from Authorization header.
+fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+/// Middleware that validates JWT tokens and injects resolved scopes into request extensions.
+///
+/// This middleware handles the three AuthMode variants:
+/// - `Required`: Rejects requests without a valid Bearer token
+/// - `Optional`: Validates tokens if present, uses fallback scopes for unauthenticated requests
+/// - `None`: Uses fallback scopes for all requests (no auth)
+///
+/// On success, injects `ResolvedScopes` into the request extensions for handlers to use.
+async fn auth_middleware(
+    State(state): State<AppState>,
+    mut req: Request<Body>,
+    next: Next,
+) -> Response {
+    let mode = state.config.server.mode;
+    let fallback_scopes = &state.config.scopes;
+
+    // For AuthMode::None, use fallback scopes directly
+    if mode == AuthMode::None {
+        req.extensions_mut()
+            .insert(ResolvedScopes(fallback_scopes.clone()));
+        return next.run(req).await;
+    }
+
+    // Extract Bearer token from Authorization header
+    let token = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    match (token, &state.token_authority) {
+        // Token present and authority configured - validate and inject token scopes
+        (Some(token), Some(authority)) => match authority.validate(token) {
+            Ok(claims) => {
+                req.extensions_mut()
+                    .insert(ResolvedScopes(claims.scopes.clone()));
+                next.run(req).await
+            }
+            Err(TokenError::Expired) => {
+                tracing::debug!("Rejected request with expired token");
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(AuthError::new("token has expired")),
+                )
+                    .into_response()
+            }
+            Err(TokenError::InvalidSignature) => {
+                tracing::debug!("Rejected request with invalid token signature");
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(AuthError::new("invalid token")),
+                )
+                    .into_response()
+            }
+            Err(_) => {
+                tracing::debug!("Rejected request with invalid token");
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(AuthError::new("invalid token")),
+                )
+                    .into_response()
+            }
+        },
+        // No token but mode is Optional - use fallback scopes
+        (None, _) if mode == AuthMode::Optional => {
+            req.extensions_mut()
+                .insert(ResolvedScopes(fallback_scopes.clone()));
+            next.run(req).await
+        }
+        // No token and mode is Required - reject
+        (None, _) if mode == AuthMode::Required => {
+            tracing::debug!("Rejected request without token in Required mode");
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(AuthError::new("authentication required")),
+            )
+                .into_response()
+        }
+        // Token present but no authority configured - reject without revealing config state
+        (Some(_), None) => {
+            tracing::warn!("Token provided but token authority not configured");
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(AuthError::new("authentication failed")),
+            )
+                .into_response()
+        }
+        // No token with any authority config - this handles edge cases not covered above
+        // (e.g., AuthMode is somehow not Required/Optional after the None check, or
+        // authority is configured but no token and mode isn't matched above)
+        (None, _) => {
+            // Use fallback scopes - this is safe since AuthMode::Required is already handled
+            req.extensions_mut()
+                .insert(ResolvedScopes(fallback_scopes.clone()));
+            next.run(req).await
+        }
+    }
 }
