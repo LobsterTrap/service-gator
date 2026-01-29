@@ -40,6 +40,7 @@ use eyre::{bail, Result};
 use serde_json;
 
 use graphql_parser::query::{Definition, OperationDefinition};
+use itertools::Itertools;
 
 use crate::scope::{GhOpType, OpType};
 
@@ -711,19 +712,51 @@ fn extract_api_path(args: &[String]) -> Option<String> {
     None
 }
 
-/// Extract repository from an API path like `/repos/owner/repo/...`.
-fn extract_repo_from_api_path(path: &str) -> Option<String> {
-    // Handle paths like /repos/owner/repo/... or repos/owner/repo/...
-    let path = path.trim_start_matches('/');
+/// Validate that a path component (owner or repo name) contains only valid characters.
+/// GitHub allows alphanumeric, hyphens, underscores, and dots.
+fn is_valid_path_component(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
 
-    if let Some(rest) = path.strip_prefix("repos/") {
-        let parts: Vec<&str> = rest.splitn(3, '/').collect();
-        if parts.len() >= 2 {
-            return Some(format!("{}/{}", parts[0], parts[1]));
-        }
+/// Extract repository from an API path like `/repos/owner/repo/...`.
+pub fn extract_repo_from_api_path(path: &str) -> Option<String> {
+    let path = path.trim_start_matches('/');
+    let rest = path.strip_prefix("repos/")?;
+    let [owner, repo]: [&str; 2] = rest.split('/').next_array()?;
+
+    // Validate path components to prevent injection attacks
+    if !is_valid_path_component(owner) || !is_valid_path_component(repo) {
+        return None;
     }
 
-    None
+    Some(format!("{owner}/{repo}"))
+}
+
+/// Extract resource reference from an API path.
+///
+/// Returns references in the format `owner/repo#N` for paths that target
+/// specific PRs or issues. This enables scoped write permissions.
+///
+/// Examples:
+/// - `/repos/owner/repo/pulls/123` → Some("owner/repo#123")
+/// - `/repos/owner/repo/issues/456` → Some("owner/repo#456")
+/// - `/repos/owner/repo/pulls/123/comments` → Some("owner/repo#123")
+/// - `/repos/owner/repo/pulls` → None (no specific resource)
+pub fn extract_resource_from_api_path(path: &str) -> Option<String> {
+    let path = path.trim_start_matches('/');
+    let rest = path.strip_prefix("repos/")?;
+    // Pattern: owner/repo/resource_type/resource_id[/...]
+    let [owner, repo, resource_type, resource_id]: [&str; 4] = rest.split('/').next_array()?;
+
+    // Only return if resource_id is a valid number and resource type is PR or issue
+    resource_id.parse::<u64>().ok()?;
+
+    match resource_type {
+        "pulls" | "issues" => Some(format!("{owner}/{repo}#{resource_id}")),
+        _ => None,
+    }
 }
 
 /// Parsed gh command arguments.
@@ -1019,6 +1052,43 @@ mod tests {
         );
         assert_eq!(extract_repo_from_api_path("/user/repos"), None);
         assert_eq!(extract_repo_from_api_path("/orgs/foo/repos"), None);
+    }
+
+    #[test]
+    fn test_extract_resource_from_api_path() {
+        // PR endpoints - returns owner/repo#N format for permission matching
+        assert_eq!(
+            extract_resource_from_api_path("/repos/owner/repo/pulls/123"),
+            Some("owner/repo#123".into())
+        );
+        assert_eq!(
+            extract_resource_from_api_path("repos/owner/repo/pulls/456/comments"),
+            Some("owner/repo#456".into())
+        );
+        // Issue endpoints
+        assert_eq!(
+            extract_resource_from_api_path("/repos/owner/repo/issues/789"),
+            Some("owner/repo#789".into())
+        );
+        assert_eq!(
+            extract_resource_from_api_path("repos/myorg/myrepo/issues/42/labels"),
+            Some("myorg/myrepo#42".into())
+        );
+        // No specific resource
+        assert_eq!(
+            extract_resource_from_api_path("/repos/owner/repo/pulls"),
+            None
+        );
+        assert_eq!(
+            extract_resource_from_api_path("/repos/owner/repo/issues"),
+            None
+        );
+        assert_eq!(extract_resource_from_api_path("/repos/owner/repo"), None);
+        // Non-PR/issue resources don't have scoped permissions
+        assert_eq!(
+            extract_resource_from_api_path("/repos/owner/repo/branches/main"),
+            None
+        );
     }
 
     #[test]

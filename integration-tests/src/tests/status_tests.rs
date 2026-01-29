@@ -246,7 +246,7 @@ repos = { "test/repo" = { read = true } }
     );
 
     // Verify service tools are available
-    let expected_service_tools = vec!["gh", "gl", "forgejo", "jira"];
+    let expected_service_tools = vec!["github", "gl", "forgejo", "jira"];
     for service in expected_service_tools {
         assert!(
             tool_names.contains(&service),

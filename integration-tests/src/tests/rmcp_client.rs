@@ -78,9 +78,9 @@ fn test_rmcp_client_list_tools() -> Result<()> {
         let tools = session.list_tools().await?;
         assert!(!tools.is_empty(), "Expected at least one tool");
 
-        // Verify the 'gh' tool is present
-        let gh_tool = tools.iter().find(|t| t.name == "gh");
-        assert!(gh_tool.is_some(), "Expected 'gh' tool to be available");
+        // Verify the 'github' tool is present
+        let gh_tool = tools.iter().find(|t| t.name == "github");
+        assert!(gh_tool.is_some(), "Expected 'github' tool to be available");
 
         session.close().await?;
         Ok(())
@@ -105,13 +105,14 @@ fn test_rmcp_client_gh_allowed_repo() -> Result<()> {
     rt.block_on(async {
         let session = RmcpSession::connect(&server.mcp_url()).await?;
 
-        // Call gh api to get repo info
+        // Call github api to get repo info
         let api_path = format!("repos/{}", test_repo);
         let result = session
             .call_tool(
-                "gh",
+                "github",
                 serde_json::json!({
-                    "args": ["api", api_path]
+                    "operation": "api",
+                    "endpoint": api_path
                 }),
             )
             .await?;
@@ -157,9 +158,10 @@ fn test_rmcp_client_gh_denied_repo() -> Result<()> {
         // Try to access a repo that is NOT in the allowed list
         let result = session
             .call_tool(
-                "gh",
+                "github",
                 serde_json::json!({
-                    "args": ["api", "repos/torvalds/linux"]
+                    "operation": "api",
+                    "endpoint": "repos/torvalds/linux"
                 }),
             )
             .await?;
@@ -207,9 +209,10 @@ fn test_rmcp_client_wildcard_pattern() -> Result<()> {
         let api_path = format!("repos/{}", test_repo);
         let result = session
             .call_tool(
-                "gh",
+                "github",
                 serde_json::json!({
-                    "args": ["api", api_path]
+                    "operation": "api",
+                    "endpoint": api_path
                 }),
             )
             .await?;
@@ -224,9 +227,10 @@ fn test_rmcp_client_wildcard_pattern() -> Result<()> {
         // A different owner should be denied
         let denied_result = session
             .call_tool(
-                "gh",
+                "github",
                 serde_json::json!({
-                    "args": ["api", "repos/torvalds/linux"]
+                    "operation": "api",
+                    "endpoint": "repos/torvalds/linux"
                 }),
             )
             .await?;

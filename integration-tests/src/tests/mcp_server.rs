@@ -209,17 +209,153 @@ impl McpSession {
         Ok((status, body))
     }
 
-    /// Call the gh tool via MCP
-    fn call_gh(&mut self, args: Vec<&str>) -> Result<Value> {
+    /// Call the github tool's api operation via MCP
+    fn call_github_api(&mut self, endpoint: &str, jq: Option<&str>) -> Result<Value> {
         let id = self.next_id();
+        let mut arguments = json!({
+            "operation": "api",
+            "endpoint": endpoint
+        });
+        if let Some(jq_expr) = jq {
+            arguments["jq"] = json!(jq_expr);
+        }
         let request = json!({
             "jsonrpc": "2.0",
             "method": "tools/call",
             "params": {
-                "name": "gh",
-                "arguments": {
-                    "args": args
-                }
+                "name": "github",
+                "arguments": arguments
+            },
+            "id": id
+        });
+
+        self.send_request(request)
+    }
+
+    /// Legacy wrapper for tests that used call_gh with ["api", endpoint] pattern
+    fn call_gh(&mut self, args: Vec<&str>) -> Result<Value> {
+        // Parse the old format: ["api", endpoint] or ["api", endpoint, "--jq", expr]
+        if args.first() == Some(&"api") && args.len() >= 2 {
+            let endpoint = args[1];
+            let jq = if args.len() >= 4 && args[2] == "--jq" {
+                Some(args[3])
+            } else {
+                None
+            };
+            self.call_github_api(endpoint, jq)
+        } else {
+            // For non-api calls (like "pr list"), return an error since they're no longer supported
+            let id = self.next_id();
+            let request = json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {
+                    "name": "github",
+                    "arguments": {
+                        "operation": "api",
+                        "endpoint": "invalid-test-call"
+                    }
+                },
+                "id": id
+            });
+            self.send_request(request)
+        }
+    }
+
+    /// Call the github tool's api operation with method and body
+    fn call_github_api_with_method(
+        &mut self,
+        endpoint: &str,
+        method: &str,
+        body: Option<Value>,
+        jq: Option<&str>,
+    ) -> Result<Value> {
+        let id = self.next_id();
+        let mut arguments = json!({
+            "operation": "api",
+            "endpoint": endpoint,
+            "method": method
+        });
+        if let Some(body_value) = body {
+            arguments["body"] = body_value;
+        }
+        if let Some(jq_expr) = jq {
+            arguments["jq"] = json!(jq_expr);
+        }
+        let request = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {
+                "name": "github",
+                "arguments": arguments
+            },
+            "id": id
+        });
+
+        self.send_request(request)
+    }
+
+    /// Call the github tool's create-draft-pr operation
+    fn call_github_create_draft_pr(
+        &mut self,
+        repo: &str,
+        head: &str,
+        base: &str,
+        title: &str,
+        body: Option<&str>,
+    ) -> Result<Value> {
+        let id = self.next_id();
+        let mut arguments = json!({
+            "operation": "create-draft-pr",
+            "repo": repo,
+            "head": head,
+            "base": base,
+            "title": title
+        });
+        if let Some(body_text) = body {
+            arguments["body"] = json!(body_text);
+        }
+        let request = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {
+                "name": "github",
+                "arguments": arguments
+            },
+            "id": id
+        });
+
+        self.send_request(request)
+    }
+
+    /// Call the github tool's pending-review operation
+    fn call_github_pending_review(
+        &mut self,
+        review_operation: &str,
+        repo: &str,
+        pull_number: u64,
+        review_id: Option<u64>,
+        body: Option<&str>,
+    ) -> Result<Value> {
+        let id = self.next_id();
+        let mut arguments = json!({
+            "operation": "pending-review",
+            "review-operation": review_operation,
+            "repo": repo,
+            "pull_number": pull_number
+        });
+        if let Some(rid) = review_id {
+            arguments["review_id"] = json!(rid);
+        }
+        if let Some(body_text) = body {
+            arguments["body"] = json!(body_text);
+        }
+        let request = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {
+                "name": "github",
+                "arguments": arguments
             },
             "id": id
         });
@@ -437,7 +573,7 @@ fn test_mcp_github_wildcard_pattern() -> Result<()> {
 }
 integration_test!(test_mcp_github_wildcard_pattern);
 
-/// Test that only gh api is allowed (not other subcommands)
+/// Test that github tool api operation requires valid repo paths
 fn test_mcp_github_api_only() -> Result<()> {
     let test_owner = get_test_owner();
     let test_repo = get_test_repo();
@@ -457,8 +593,9 @@ fn test_mcp_github_api_only() -> Result<()> {
     let _ = session.initialize()?;
     session.send_initialized()?;
 
-    // Try to use a non-api subcommand (should fail)
-    let response = session.call_gh(vec!["pr", "list", "-R", &test_repo])?;
+    // Valid api call should work
+    let api_path = format!("repos/{}", test_repo);
+    let response = session.call_github_api(&api_path, None)?;
 
     let result = &response["result"];
     let is_error = result
@@ -466,23 +603,23 @@ fn test_mcp_github_api_only() -> Result<()> {
         .and_then(|e| e.as_bool())
         .unwrap_or(false);
     assert!(
-        is_error,
-        "Expected 'pr list' to be rejected (only api allowed), got: {}",
+        !is_error,
+        "Expected valid api call to succeed, got: {}",
         result
     );
 
-    let error_text = result
-        .get("content")
-        .and_then(|c| c.as_array())
-        .and_then(|a| a.first())
-        .and_then(|c| c.get("text"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
+    // Non-repo endpoint should be rejected
+    let invalid_response = session.call_github_api("user", None)?;
 
+    let invalid_result = &invalid_response["result"];
+    let invalid_is_error = invalid_result
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
     assert!(
-        error_text.contains("api") || error_text.contains("supported"),
-        "Expected error to mention 'api' restriction, got: {}",
-        error_text
+        invalid_is_error,
+        "Expected non-repo endpoint to be rejected, got: {}",
+        invalid_result
     );
 
     Ok(())
@@ -742,3 +879,225 @@ mode = "none"
     Ok(())
 }
 integration_test!(test_mcp_auth_mode_none);
+
+// ============================================================================
+// GitHub Tool Security Tests
+// ============================================================================
+
+/// Test that API write operations are denied without write permission
+fn test_mcp_github_api_write_denied_without_permission() -> Result<()> {
+    let test_repo = get_test_repo();
+
+    // Only read permission, no write
+    let config = format!(
+        r#"
+[gh.repos]
+"{}" = {{ read = true }}
+"#,
+        test_repo
+    );
+
+    let server = McpServerHandle::start(&config)?;
+    let mut session = McpSession::new(&server.mcp_url());
+    let _ = session.initialize()?;
+    session.send_initialized()?;
+
+    // Try to POST to the repo API
+    let response = session.call_github_api_with_method(
+        &format!("repos/{}/issues", test_repo),
+        "POST",
+        Some(json!({"title": "Test issue", "body": "Should be denied"})),
+        None,
+    )?;
+
+    let result = &response["result"];
+    let is_error = result
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+    assert!(
+        is_error,
+        "Expected write to be denied without write permission, got: {}",
+        result
+    );
+
+    let error_text = result["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        error_text.contains("not allowed") || error_text.contains("Write access"),
+        "Expected permission error, got: {}",
+        error_text
+    );
+
+    Ok(())
+}
+integration_test!(test_mcp_github_api_write_denied_without_permission);
+
+/// Test that create-draft-pr is denied without create-draft permission
+fn test_mcp_github_create_draft_pr_denied() -> Result<()> {
+    let test_repo = get_test_repo();
+
+    // Read-only permission (explicitly disable create-draft)
+    let config = format!(
+        r#"
+[gh.repos]
+"{}" = {{ read = true, create-draft = false, pending-review = false }}
+"#,
+        test_repo
+    );
+
+    let server = McpServerHandle::start(&config)?;
+    let mut session = McpSession::new(&server.mcp_url());
+    let _ = session.initialize()?;
+    session.send_initialized()?;
+
+    let response =
+        session.call_github_create_draft_pr(&test_repo, "test-branch", "main", "Test PR", None)?;
+
+    let result = &response["result"];
+    let is_error = result
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+    assert!(
+        is_error,
+        "Expected create-draft-pr to be denied without permission, got: {}",
+        result
+    );
+
+    let error_text = result["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        error_text.contains("not granted") || error_text.contains("create-draft"),
+        "Expected permission error, got: {}",
+        error_text
+    );
+
+    Ok(())
+}
+integration_test!(test_mcp_github_create_draft_pr_denied);
+
+/// Test that pending-review is denied without pending-review permission
+fn test_mcp_github_pending_review_denied() -> Result<()> {
+    let test_repo = get_test_repo();
+
+    // Read-only permission (explicitly disable pending-review)
+    let config = format!(
+        r#"
+[gh.repos]
+"{}" = {{ read = true, create-draft = false, pending-review = false }}
+"#,
+        test_repo
+    );
+
+    let server = McpServerHandle::start(&config)?;
+    let mut session = McpSession::new(&server.mcp_url());
+    let _ = session.initialize()?;
+    session.send_initialized()?;
+
+    let response = session.call_github_pending_review("list", &test_repo, 1, None, None)?;
+
+    let result = &response["result"];
+    let is_error = result
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+    assert!(
+        is_error,
+        "Expected pending-review to be denied, got: {}",
+        result
+    );
+
+    let error_text = result["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        error_text.contains("not granted") || error_text.contains("pending-review"),
+        "Expected permission error, got: {}",
+        error_text
+    );
+
+    Ok(())
+}
+integration_test!(test_mcp_github_pending_review_denied);
+
+/// Test that non-repo endpoints are rejected
+fn test_mcp_github_api_non_repo_endpoint_rejected() -> Result<()> {
+    let test_repo = get_test_repo();
+
+    let config = format!(
+        r#"
+[gh.repos]
+"{}" = {{ read = true }}
+"#,
+        test_repo
+    );
+
+    let server = McpServerHandle::start(&config)?;
+    let mut session = McpSession::new(&server.mcp_url());
+    let _ = session.initialize()?;
+    session.send_initialized()?;
+
+    // Try to access /user endpoint (not a repo endpoint)
+    let response = session.call_github_api("user", None)?;
+
+    let result = &response["result"];
+    let is_error = result
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+    assert!(is_error, "Expected non-repo endpoint to be rejected");
+
+    let error_text = result["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        error_text.contains("Could not determine target repository"),
+        "Expected repo path error, got: {}",
+        error_text
+    );
+
+    Ok(())
+}
+integration_test!(test_mcp_github_api_non_repo_endpoint_rejected);
+
+/// Test HTTP method validation rejects invalid methods
+fn test_mcp_github_api_invalid_method_rejected() -> Result<()> {
+    let test_repo = get_test_repo();
+
+    let config = format!(
+        r#"
+[gh.repos]
+"{}" = {{ read = true, write = true }}
+"#,
+        test_repo
+    );
+
+    let server = McpServerHandle::start(&config)?;
+    let mut session = McpSession::new(&server.mcp_url());
+    let _ = session.initialize()?;
+    session.send_initialized()?;
+
+    // Try an invalid HTTP method
+    let response = session.call_github_api_with_method(
+        &format!("repos/{}", test_repo),
+        "TRACE",
+        None,
+        None,
+    )?;
+
+    let result = &response["result"];
+    let is_error = result
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+    assert!(
+        is_error,
+        "Expected invalid method to be rejected, got: {}",
+        result
+    );
+
+    let error_text = result["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        error_text.contains("Invalid HTTP method"),
+        "Expected method validation error, got: {}",
+        error_text
+    );
+
+    Ok(())
+}
+integration_test!(test_mcp_github_api_invalid_method_rejected);
