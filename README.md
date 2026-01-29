@@ -206,7 +206,7 @@ flowchart TB
         agent["AI Agent"]
     end
 
-    subgraph host["Host System (trusted)"]
+    subgraph host["Outer system"]
         gator["service-gator<br/>(scope enforcement)"]
         cli["gh / glab / tea / jira<br/>(full access)"]
         creds["GH_TOKEN, etc."]
@@ -223,6 +223,10 @@ The sandboxed agent:
 - Cannot read environment variables containing credentials
 - Cannot execute arbitrary binaries
 - Must go through service-gator which enforces scope restrictions
+
+Here the "outer system" could be anything, but a good way to do
+this is e.g. distinct containers (or a host system with a containerized
+agent), etc.
 
 ## Configuration File (Optional)
 
