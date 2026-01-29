@@ -61,12 +61,64 @@ use crate::jira::{self, JiraSubcommand};
 use crate::jira_client::JiraClient;
 use crate::scope::{GhOpType, OpType, ScopeConfig};
 
-/// Input schema for GitHub CLI tool.
+/// Input schema for the unified GitHub tool.
+///
+/// This tool provides explicit subcommands for GitHub operations:
+/// - `api`: REST API access (read or write depending on method and permissions)
+/// - `create-draft-pr`: Create a draft pull request
+/// - `pending-review`: Manage pending PR reviews
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct GhToolInput {
-    /// Command arguments for `gh api` (e.g., ["api", "repos/owner/repo/pulls"])
-    /// Only the `api` subcommand is supported for read-only access.
-    pub args: Vec<String>,
+#[serde(tag = "operation", rename_all = "kebab-case")]
+pub enum GithubToolInput {
+    /// GitHub REST API access.
+    /// Supports both read (GET) and write (POST/PUT/PATCH/DELETE) operations.
+    /// Write operations require write permission for the target repository.
+    Api {
+        /// The API endpoint path (e.g., "repos/owner/repo/pulls")
+        endpoint: String,
+        /// HTTP method: GET (default), POST, PUT, PATCH, DELETE
+        #[serde(default)]
+        method: Option<String>,
+        /// Request body as JSON (for POST/PUT/PATCH)
+        #[serde(default)]
+        body: Option<serde_json::Value>,
+        /// Optional jq expression to filter output
+        #[serde(default)]
+        jq: Option<String>,
+    },
+    /// Create a draft pull request.
+    CreateDraftPr {
+        /// Repository in "owner/repo" format
+        repo: String,
+        /// The branch where your changes are implemented
+        head: String,
+        /// The branch you want the changes pulled into (usually "main")
+        base: String,
+        /// The title of the pull request
+        title: String,
+        /// The body/description of the pull request
+        #[serde(default)]
+        body: Option<String>,
+    },
+    /// Manage pending PR reviews.
+    PendingReview {
+        /// The sub-operation: "list", "create", "get", "update", "delete"
+        #[serde(rename = "review-operation")]
+        review_operation: String,
+        /// Repository in "owner/repo" format
+        repo: String,
+        /// Pull request number
+        pull_number: u64,
+        /// Review ID (required for get/update/delete operations)
+        #[serde(default)]
+        review_id: Option<u64>,
+        /// Review body text (required for create, optional for update)
+        #[serde(default)]
+        body: Option<String>,
+        /// Review comments for create operation
+        #[serde(default)]
+        comments: Option<Vec<ReviewComment>>,
+    },
 }
 
 /// Input schema for GitLab CLI tool.
@@ -93,26 +145,6 @@ pub struct ForgejoToolInput {
     /// Forgejo host (e.g., "codeberg.org") - required if multiple hosts configured
     #[serde(default)]
     pub host: Option<String>,
-}
-
-/// Input schema for pending review operations.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct PendingReviewInput {
-    /// The operation to perform: "list", "create", "get", "update", "delete"
-    pub operation: String,
-    /// Repository in "owner/repo" format
-    pub repo: String,
-    /// Pull request number
-    pub pull_number: u64,
-    /// Review ID (required for get/update/delete operations)
-    #[serde(default)]
-    pub review_id: Option<u64>,
-    /// Review body text (required for create, optional for update)
-    #[serde(default)]
-    pub body: Option<String>,
-    /// Review comments for create operation
-    #[serde(default)]
-    pub comments: Option<Vec<ReviewComment>>,
 }
 
 /// A review comment on a specific file/line.
@@ -296,83 +328,418 @@ impl ServiceGatorServer {
 
         Ok(result)
     }
-}
 
-/// Tool definitions for the MCP server.
-#[tool_router]
-impl ServiceGatorServer {
-    /// Execute a GitHub API command within configured scopes.
-    /// Operations are restricted by scope permissions (read, draft-pr, pending-review, write).
-    #[tool(
-        description = "Execute GitHub API commands within configured scope permissions. Use 'gh api <endpoint> [--jq <expr>]' for API access. Write operations (draft PRs, pending reviews) available if permitted by scope. Use the 'status' tool to view current capabilities."
-    )]
-    async fn gh(
+    /// Handle the `api` operation of the github tool.
+    async fn github_api(
         &self,
-        Extension(parts): Extension<http::request::Parts>,
-        Parameters(input): Parameters<GhToolInput>,
+        config: &ScopeConfig,
+        endpoint: &str,
+        method: Option<&str>,
+        body: Option<serde_json::Value>,
+        jq: Option<&str>,
     ) -> Result<CallToolResult, McpError> {
-        let args = input.args;
-        let config = get_scopes_from_parts(&parts)?;
-
-        // Only allow `gh api` subcommand
-        let first_arg = args.first().map(|s| s.as_str());
-        if first_arg != Some("api") {
-            return Ok(CallToolResult::error(vec![Content::text(
-                "Only `gh api` is supported. Use `gh api repos/OWNER/REPO/...` to access the REST API. For capability information, use the 'status' tool.",
-            )]));
+        // Normalize method (default to GET) and validate against whitelist
+        let method = method
+            .map(|m| m.to_uppercase())
+            .unwrap_or_else(|| "GET".to_string());
+        const ALLOWED_METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE"];
+        if !ALLOWED_METHODS.contains(&method.as_str()) {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Invalid HTTP method: {method}. Allowed methods: GET, POST, PUT, PATCH, DELETE"
+            ))]));
         }
+        let is_write = method != "GET";
 
-        // Parse and validate the API command using clap
-        let api = match github::parse_api(&args) {
-            Ok(a) => a,
-            Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "{e:#}. Only endpoint path and --jq option are allowed."
-                ))]));
+        // For GraphQL endpoint, reject writes (mutations should use dedicated tools)
+        if endpoint == "graphql" {
+            if is_write {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "GraphQL mutations are not supported via api operation. Use dedicated tools.",
+                )]));
             }
-        };
-
-        // Permission check: GraphQL vs REST
-        if api.is_graphql {
-            // GraphQL permission check (global, not per-repo)
-            // Note: Mutations are already rejected in parse_api()
             if !config.gh.graphql_read_allowed() {
                 return Ok(CallToolResult::error(vec![Content::text(
                     "GraphQL read access not allowed. Set `graphql = \"read\"` or `graphql = true` in [gh] config.",
                 )]));
             }
-        } else {
-            // REST API - check per-repo permission
-            let repo = match &api.repo {
-                Some(r) => r,
-                None => {
-                    return Ok(CallToolResult::error(vec![Content::text(
-                        "Could not determine target repository from API path. \
-                         Use path like /repos/owner/repo/...",
-                    )]));
-                }
-            };
+        }
 
-            if !config.gh.is_read_allowed(repo) {
+        // Extract repo from endpoint path
+        let repo = github::extract_repo_from_api_path(endpoint);
+        let repo = match repo {
+            Some(r) => r,
+            None => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "Could not determine target repository from API path. \
+                     Use path like repos/owner/repo/...",
+                )]));
+            }
+        };
+
+        // Extract resource ref (e.g., "pr/123" or "issue/456") for scoped write permissions
+        let resource_ref = github::extract_resource_from_api_path(endpoint);
+
+        // Permission check
+        if is_write {
+            // For writes, check WriteResource permission (can be scoped to PR/issue)
+            if !config
+                .gh
+                .is_allowed(&repo, GhOpType::WriteResource, resource_ref.as_deref())
+            {
+                let scope_msg = if let Some(ref res) = resource_ref {
+                    format!(" (resource: {})", res)
+                } else {
+                    String::new()
+                };
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Write access not allowed for repository: {repo}{scope_msg}"
+                ))]));
+            }
+        } else {
+            // For reads, check read permission
+            if !config.gh.is_read_allowed(&repo) {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
                     "Read access not allowed for repository: {repo}"
                 ))]));
             }
         }
 
-        // Build final args with forced GET method
-        let final_args = github::build_api_args(&api);
+        // Build the gh api command args
+        let mut args = vec![
+            "api".to_string(),
+            format!("--method={}", method),
+            endpoint.to_string(),
+        ];
 
-        // Execute
-        match self.exec_command("gh", &final_args).await {
-            Ok(output) => {
-                if output.is_empty() {
-                    Ok(CallToolResult::success(vec![Content::text("(no output)")]))
-                } else {
-                    Ok(CallToolResult::success(vec![Content::text(output)]))
+        if let Some(jq_expr) = jq {
+            args.push("--jq".to_string());
+            args.push(jq_expr.to_string());
+        }
+
+        // Execute with or without body
+        if let Some(body_value) = body {
+            args.push("--input".to_string());
+            args.push("-".to_string());
+            let body_str = body_value.to_string();
+            match self.exec_command_with_stdin("gh", &args, &body_str).await {
+                Ok(output) => {
+                    if output.is_empty() {
+                        Ok(CallToolResult::success(vec![Content::text("(no output)")]))
+                    } else {
+                        Ok(CallToolResult::success(vec![Content::text(output)]))
+                    }
+                }
+                Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+            }
+        } else {
+            match self.exec_command("gh", &args).await {
+                Ok(output) => {
+                    if output.is_empty() {
+                        Ok(CallToolResult::success(vec![Content::text("(no output)")]))
+                    } else {
+                        Ok(CallToolResult::success(vec![Content::text(output)]))
+                    }
+                }
+                Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+            }
+        }
+    }
+
+    /// Handle the `create-draft-pr` operation of the github tool.
+    async fn github_create_draft_pr(
+        &self,
+        config: &ScopeConfig,
+        repo: &str,
+        head: &str,
+        base: &str,
+        title: &str,
+        body: Option<&str>,
+    ) -> Result<CallToolResult, McpError> {
+        // Check permission
+        if !config.gh.is_allowed(repo, GhOpType::CreateDraft, None) {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "create-draft permission not granted for repository: {repo}"
+            ))]));
+        }
+
+        // Build the API endpoint
+        let endpoint = format!("repos/{}/pulls", repo);
+
+        // Build the payload - always set draft to true
+        let payload = serde_json::json!({
+            "title": title,
+            "head": head,
+            "base": base,
+            "body": body.unwrap_or(""),
+            "draft": true,
+        });
+
+        let args = vec![
+            "api".to_string(),
+            "--method=POST".to_string(),
+            endpoint,
+            "--input".to_string(),
+            "-".to_string(),
+        ];
+
+        let payload_str = payload.to_string();
+        match self
+            .exec_command_with_stdin("gh", &args, &payload_str)
+            .await
+        {
+            Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+        }
+    }
+
+    /// Handle the `pending-review` operation of the github tool.
+    #[allow(clippy::too_many_arguments)]
+    async fn github_pending_review(
+        &self,
+        config: &ScopeConfig,
+        operation: &str,
+        repo: &str,
+        pull_number: u64,
+        review_id: Option<u64>,
+        body: Option<&str>,
+        comments: Option<Vec<ReviewComment>>,
+    ) -> Result<CallToolResult, McpError> {
+        // Check permission
+        if !config
+            .gh
+            .is_allowed(repo, GhOpType::ManagePendingReview, None)
+        {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "pending-review permission not granted for repository: {repo}"
+            ))]));
+        }
+
+        // Parse operation
+        let op = match operation.to_lowercase().as_str() {
+            "list" => PendingReviewOp::List,
+            "create" => PendingReviewOp::Create,
+            "get" => PendingReviewOp::Get,
+            "update" => PendingReviewOp::Update,
+            "delete" => PendingReviewOp::Delete,
+            other => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Unknown review-operation: {other}. Use: list, create, get, update, delete"
+                ))]));
+            }
+        };
+
+        // Validate review_id for operations that need it
+        if matches!(
+            op,
+            PendingReviewOp::Get | PendingReviewOp::Update | PendingReviewOp::Delete
+        ) && review_id.is_none()
+        {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "review_id is required for get/update/delete operations",
+            )]));
+        }
+
+        // Build the endpoint path
+        let endpoint = match review_id {
+            Some(id) => format!("repos/{}/pulls/{}/reviews/{}", repo, pull_number, id),
+            None => format!("repos/{}/pulls/{}/reviews", repo, pull_number),
+        };
+
+        // For update/delete, first fetch the review to validate marker token
+        if matches!(op, PendingReviewOp::Update | PendingReviewOp::Delete) {
+            let get_args = vec![
+                "api".to_string(),
+                "--method=GET".to_string(),
+                endpoint.clone(),
+            ];
+
+            let review_json = match self.exec_command("gh", &get_args).await {
+                Ok(output) => output,
+                Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
+            };
+
+            let review: serde_json::Value = match serde_json::from_str(&review_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Failed to parse review JSON: {e}"
+                    ))]));
+                }
+            };
+
+            // Validate marker token
+            if let Err(e) = github::validate_review_marker(&review) {
+                return Ok(CallToolResult::error(vec![Content::text(format!("{e:#}"))]));
+            }
+
+            // Validate pending state
+            if let Err(e) = github::validate_review_pending(&review) {
+                return Ok(CallToolResult::error(vec![Content::text(format!("{e:#}"))]));
+            }
+        }
+
+        // Execute the operation
+        match op {
+            PendingReviewOp::List | PendingReviewOp::Get => {
+                let args = vec!["api".to_string(), "--method=GET".to_string(), endpoint];
+                match self.exec_command("gh", &args).await {
+                    Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
+                    Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
                 }
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+
+            PendingReviewOp::Create => {
+                let body_text = body.unwrap_or("");
+                let body_with_marker = if body_text.contains(REVIEW_MARKER_TOKEN) {
+                    body_text.to_string()
+                } else {
+                    format!("{}\n\n{}", REVIEW_MARKER_TOKEN, body_text)
+                };
+
+                let mut payload = serde_json::json!({
+                    "body": body_with_marker,
+                });
+
+                if let Some(ref comments) = comments {
+                    payload["comments"] = serde_json::to_value(comments).unwrap_or_default();
+                }
+
+                let args = vec![
+                    "api".to_string(),
+                    "--method=POST".to_string(),
+                    endpoint,
+                    "--input".to_string(),
+                    "-".to_string(),
+                ];
+
+                let payload_str = payload.to_string();
+                match self
+                    .exec_command_with_stdin("gh", &args, &payload_str)
+                    .await
+                {
+                    Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
+                    Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+                }
+            }
+
+            PendingReviewOp::Update => {
+                let body_text = match body {
+                    Some(b) => b,
+                    None => {
+                        return Ok(CallToolResult::error(vec![Content::text(
+                            "body is required for update operation",
+                        )]));
+                    }
+                };
+
+                let body_with_marker = if body_text.contains(REVIEW_MARKER_TOKEN) {
+                    body_text.to_string()
+                } else {
+                    format!("{}\n\n{}", REVIEW_MARKER_TOKEN, body_text)
+                };
+
+                let payload = serde_json::json!({
+                    "body": body_with_marker,
+                });
+
+                let args = vec![
+                    "api".to_string(),
+                    "--method=PUT".to_string(),
+                    endpoint,
+                    "--input".to_string(),
+                    "-".to_string(),
+                ];
+
+                let payload_str = payload.to_string();
+                match self
+                    .exec_command_with_stdin("gh", &args, &payload_str)
+                    .await
+                {
+                    Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
+                    Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+                }
+            }
+
+            PendingReviewOp::Delete => {
+                let args = vec!["api".to_string(), "--method=DELETE".to_string(), endpoint];
+
+                match self.exec_command("gh", &args).await {
+                    Ok(output) => {
+                        if output.is_empty() {
+                            Ok(CallToolResult::success(vec![Content::text(
+                                "Review deleted successfully",
+                            )]))
+                        } else {
+                            Ok(CallToolResult::success(vec![Content::text(output)]))
+                        }
+                    }
+                    Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+                }
+            }
+        }
+    }
+}
+
+/// Tool definitions for the MCP server.
+#[tool_router]
+impl ServiceGatorServer {
+    /// Unified GitHub tool with explicit subcommands.
+    ///
+    /// Operations:
+    /// - `api`: Read-only REST API access
+    /// - `create-draft-pr`: Create a draft pull request
+    /// - `pending-review`: Manage pending PR reviews
+    #[tool(description = "GitHub operations with explicit subcommands. \
+        Use 'api' for read-only REST API access (endpoint like 'repos/owner/repo/pulls'). \
+        Use 'create-draft-pr' to create a draft pull request (requires create-draft permission). \
+        Use 'pending-review' to manage pending PR reviews (requires pending-review permission). \
+        Use the 'status' tool to view your current permissions.")]
+    async fn github(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(input): Parameters<GithubToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let config = get_scopes_from_parts(&parts)?;
+
+        match input {
+            GithubToolInput::Api {
+                endpoint,
+                method,
+                body,
+                jq,
+            } => {
+                self.github_api(&config, &endpoint, method.as_deref(), body, jq.as_deref())
+                    .await
+            }
+            GithubToolInput::CreateDraftPr {
+                repo,
+                head,
+                base,
+                title,
+                body,
+            } => {
+                self.github_create_draft_pr(&config, &repo, &head, &base, &title, body.as_deref())
+                    .await
+            }
+            GithubToolInput::PendingReview {
+                review_operation,
+                repo,
+                pull_number,
+                review_id,
+                body,
+                comments,
+            } => {
+                self.github_pending_review(
+                    &config,
+                    &review_operation,
+                    &repo,
+                    pull_number,
+                    review_id,
+                    body.as_deref(),
+                    comments,
+                )
+                .await
+            }
         }
     }
 
@@ -531,209 +898,6 @@ impl ServiceGatorServer {
                 }
             }
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!("{e:#}"))])),
-        }
-    }
-
-    /// Manage pending PR reviews with marker token validation.
-    #[tool(
-        description = "Create, update, or delete pending PR reviews. Reviews are created with a marker token and must remain in PENDING state until human submission. Operations: list, create, get, update, delete."
-    )]
-    async fn gh_pending_review(
-        &self,
-        Extension(parts): Extension<http::request::Parts>,
-        Parameters(input): Parameters<PendingReviewInput>,
-    ) -> Result<CallToolResult, McpError> {
-        let config = get_scopes_from_parts(&parts)?;
-
-        // Check permission
-        if !config
-            .gh
-            .is_allowed(&input.repo, GhOpType::ManagePendingReview, None)
-        {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "pending-review permission not granted for repository: {}",
-                input.repo
-            ))]));
-        }
-
-        // Parse operation
-        let op = match input.operation.to_lowercase().as_str() {
-            "list" => PendingReviewOp::List,
-            "create" => PendingReviewOp::Create,
-            "get" => PendingReviewOp::Get,
-            "update" => PendingReviewOp::Update,
-            "delete" => PendingReviewOp::Delete,
-            other => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Unknown operation: {}. Use: list, create, get, update, delete",
-                    other
-                ))]));
-            }
-        };
-
-        // Validate review_id for operations that need it
-        if matches!(
-            op,
-            PendingReviewOp::Get | PendingReviewOp::Update | PendingReviewOp::Delete
-        ) && input.review_id.is_none()
-        {
-            return Ok(CallToolResult::error(vec![Content::text(
-                "review_id is required for get/update/delete operations",
-            )]));
-        }
-
-        // Build the endpoint path
-        let endpoint = match input.review_id {
-            Some(id) => format!(
-                "repos/{}/pulls/{}/reviews/{}",
-                input.repo, input.pull_number, id
-            ),
-            None => format!("repos/{}/pulls/{}/reviews", input.repo, input.pull_number),
-        };
-
-        // For update/delete, first fetch the review to validate marker token
-        if matches!(op, PendingReviewOp::Update | PendingReviewOp::Delete) {
-            let get_args = vec![
-                "api".to_string(),
-                "--method=GET".to_string(),
-                endpoint.clone(),
-            ];
-
-            let review_json = match self.exec_command("gh", &get_args).await {
-                Ok(output) => output,
-                Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
-            };
-
-            let review: serde_json::Value = match serde_json::from_str(&review_json) {
-                Ok(v) => v,
-                Err(e) => {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "Failed to parse review JSON: {}",
-                        e
-                    ))]));
-                }
-            };
-
-            // Validate marker token
-            if let Err(e) = github::validate_review_marker(&review) {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "{:#}",
-                    e
-                ))]));
-            }
-
-            // Validate pending state
-            if let Err(e) = github::validate_review_pending(&review) {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "{:#}",
-                    e
-                ))]));
-            }
-        }
-
-        // Execute the operation
-        match op {
-            PendingReviewOp::List | PendingReviewOp::Get => {
-                let args = vec!["api".to_string(), "--method=GET".to_string(), endpoint];
-                match self.exec_command("gh", &args).await {
-                    Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
-                    Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
-                }
-            }
-
-            PendingReviewOp::Create => {
-                // Build review body with marker token
-                let body_text = input.body.as_deref().unwrap_or("");
-                let body_with_marker = if body_text.contains(REVIEW_MARKER_TOKEN) {
-                    body_text.to_string()
-                } else {
-                    format!("{}\n\n{}", REVIEW_MARKER_TOKEN, body_text)
-                };
-
-                let mut payload = serde_json::json!({
-                    "body": body_with_marker,
-                });
-
-                // Add comments if provided
-                if let Some(comments) = &input.comments {
-                    payload["comments"] = serde_json::to_value(comments).unwrap_or_default();
-                }
-
-                // Note: We don't set "event" field, which means PENDING state
-
-                let args = vec![
-                    "api".to_string(),
-                    "--method=POST".to_string(),
-                    endpoint,
-                    "--input".to_string(),
-                    "-".to_string(),
-                ];
-
-                let payload_str = payload.to_string();
-                match self
-                    .exec_command_with_stdin("gh", &args, &payload_str)
-                    .await
-                {
-                    Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
-                    Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
-                }
-            }
-
-            PendingReviewOp::Update => {
-                let body_text = match &input.body {
-                    Some(b) => b.clone(),
-                    None => {
-                        return Ok(CallToolResult::error(vec![Content::text(
-                            "body is required for update operation",
-                        )]));
-                    }
-                };
-
-                // Ensure marker token is preserved
-                let body_with_marker = if body_text.contains(REVIEW_MARKER_TOKEN) {
-                    body_text
-                } else {
-                    format!("{}\n\n{}", REVIEW_MARKER_TOKEN, body_text)
-                };
-
-                let payload = serde_json::json!({
-                    "body": body_with_marker,
-                });
-
-                let args = vec![
-                    "api".to_string(),
-                    "--method=PUT".to_string(),
-                    endpoint,
-                    "--input".to_string(),
-                    "-".to_string(),
-                ];
-
-                let payload_str = payload.to_string();
-                match self
-                    .exec_command_with_stdin("gh", &args, &payload_str)
-                    .await
-                {
-                    Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
-                    Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
-                }
-            }
-
-            PendingReviewOp::Delete => {
-                let args = vec!["api".to_string(), "--method=DELETE".to_string(), endpoint];
-
-                match self.exec_command("gh", &args).await {
-                    Ok(output) => {
-                        if output.is_empty() {
-                            Ok(CallToolResult::success(vec![Content::text(
-                                "Review deleted successfully",
-                            )]))
-                        } else {
-                            Ok(CallToolResult::success(vec![Content::text(output)]))
-                        }
-                    }
-                    Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
-                }
-            }
         }
     }
 
@@ -1004,10 +1168,9 @@ impl ServerHandler for ServiceGatorServer {
                  \
                  Available tools: \
                  - status: Overall service availability and authentication status \
-                 - gh: GitHub API access (scope-restricted: read/draft-pr/pending-review/write permissions) \
+                 - github: GitHub operations with subcommands: api (read-only), create-draft-pr, pending-review \
                  - gl: GitLab API access (scope-restricted: read/draft-mr/approve/write permissions) \
                  - forgejo: Forgejo/Gitea API access (scope-restricted: read/draft-pr/pending-review/write permissions) \
-                 - gh_pending_review: GitHub PR review management (requires pending-review permission) \
                  - jira: JIRA operations (scope-restricted: read/create/write permissions) \
                  \
                  Security: All operations are scope-restricted. Each tool operates within its configured permissions. \

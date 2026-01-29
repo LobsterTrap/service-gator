@@ -52,6 +52,7 @@ subtle = "2"
 # Tracing for structured logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+itertools = "0.14"
 
 [dev-dependencies]
 itertools = "0.14"
