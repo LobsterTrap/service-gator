@@ -9,54 +9,108 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
+// Helper functions for serde defaults
+// ============================================================================
+
+fn default_true() -> bool {
+    true
+}
+
+// ============================================================================
 // GitHub Permissions
 // ============================================================================
 
 /// Fine-grained permissions for a GitHub repository.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// # Permission Model
+///
+/// There are two ways to grant access:
+///
+/// 1. **Repo-level** (`[gh.repos]` with `"owner/repo"`): Grants safe operations
+///    that don't directly modify repository state. Defaults:
+///    - `read = true` - View PRs, issues, code
+///    - `create-draft = true` - Create draft PRs (require human to mark ready)
+///    - `pending-review = true` - Manage pending reviews (require human to submit)
+///    - `write = false` - No direct writes (merge, close, etc.)
+///
+/// 2. **Resource-level** (`[gh.prs]` with `"owner/repo#123"`): Grants write access
+///    to a specific PR or issue. When you specify a resource, the agent can
+///    work on it directly (defaults to read+write).
+///
+/// # Example
+///
+/// ```toml
+/// [gh.repos]
+/// "myorg/myrepo" = {}  # read + create-draft + pending-review
+///
+/// [gh.prs]
+/// "myorg/myrepo#42" = {}  # read + write to PR #42
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct GhRepoPermission {
     /// Can read the repository (view PRs, issues, code, etc.)
-    #[serde(default)]
+    /// Defaults to true.
+    #[serde(default = "default_true")]
     pub read: bool,
     /// Can create draft PRs in this repo.
-    #[serde(default)]
+    /// Defaults to true - drafts require human review before merge.
+    #[serde(default = "default_true")]
     pub create_draft: bool,
     /// Can create/update/delete pending PR reviews.
     /// Reviews must contain the marker token to be manageable.
-    #[serde(default)]
+    /// Defaults to true - pending reviews require human submission.
+    #[serde(default = "default_true")]
     pub pending_review: bool,
     /// Full write access (merge, close, create non-draft, etc.)
-    /// Implies all other permissions.
+    /// Defaults to false - direct writes require explicit opt-in.
     #[serde(default)]
     pub write: bool,
 }
 
+impl Default for GhRepoPermission {
+    fn default() -> Self {
+        Self {
+            read: true,
+            create_draft: true,
+            pending_review: true,
+            write: false,
+        }
+    }
+}
+
 impl GhRepoPermission {
+    /// Read-only access (no draft creation, no pending reviews, no writes).
     pub fn read_only() -> Self {
         Self {
             read: true,
-            ..Default::default()
+            create_draft: false,
+            pending_review: false,
+            write: false,
         }
     }
 
+    /// Read + create draft PRs only.
     pub fn with_draft() -> Self {
         Self {
             read: true,
             create_draft: true,
             pending_review: false,
-            ..Default::default()
+            write: false,
         }
     }
 
+    /// Read + pending review management only.
     pub fn with_pending_review() -> Self {
         Self {
             read: true,
+            create_draft: false,
             pending_review: true,
-            ..Default::default()
+            write: false,
         }
     }
 
+    /// Full write access (includes all other permissions).
     pub fn full_write() -> Self {
         Self {
             read: true,
@@ -89,14 +143,21 @@ impl GhRepoPermission {
 }
 
 /// Permissions for a specific PR or issue.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// When a resource is specified (e.g., `"owner/repo#123"`), both read and write
+/// default to true. The intent is that if you grant access to a specific PR,
+/// you want the agent to be able to work on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct GhResourcePermission {
     /// Can read this resource.
-    #[serde(default)]
+    /// Defaults to true when a resource is specified.
+    #[serde(default = "default_true")]
     pub read: bool,
     /// Can write to this resource (comment, edit, etc.)
-    #[serde(default)]
+    /// Defaults to true when a resource is specified - if you grant access
+    /// to a specific PR/issue, you typically want the agent to work on it.
+    #[serde(default = "default_true")]
     pub write: bool,
 }
 
@@ -113,6 +174,15 @@ impl GhResourcePermission {
             read: true,
             write: true,
         }
+    }
+}
+
+impl Default for GhResourcePermission {
+    /// Default to read+write when a resource is specified.
+    /// The intent is: if you explicitly grant access to PR #1234,
+    /// you want the agent to be able to work on it.
+    fn default() -> Self {
+        Self::read_write()
     }
 }
 
@@ -916,9 +986,11 @@ mod tests {
 
     #[test]
     fn test_gh_repo_permission_defaults() {
+        // Default is read + create-draft + pending-review, but NOT write
         let p = GhRepoPermission::default();
-        assert!(!p.can_read());
-        assert!(!p.can_create_draft());
+        assert!(p.can_read());
+        assert!(p.can_create_draft());
+        assert!(p.can_manage_pending_review());
         assert!(!p.can_write());
     }
 
@@ -927,6 +999,7 @@ mod tests {
         let p = GhRepoPermission::read_only();
         assert!(p.can_read());
         assert!(!p.can_create_draft());
+        assert!(!p.can_manage_pending_review());
         assert!(!p.can_write());
     }
 
@@ -935,6 +1008,7 @@ mod tests {
         let p = GhRepoPermission::with_draft();
         assert!(p.can_read());
         assert!(p.can_create_draft());
+        assert!(!p.can_manage_pending_review());
         assert!(!p.can_write());
     }
 
@@ -943,6 +1017,7 @@ mod tests {
         let p = GhRepoPermission::full_write();
         assert!(p.can_read());
         assert!(p.can_create_draft());
+        assert!(p.can_manage_pending_review());
         assert!(p.can_write());
     }
 
