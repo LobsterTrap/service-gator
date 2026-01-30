@@ -209,11 +209,10 @@ impl McpSession {
         Ok((status, body))
     }
 
-    /// Call the github tool's api operation via MCP
+    /// Call the github_api_tool via MCP
     fn call_github_api(&mut self, endpoint: &str, jq: Option<&str>) -> Result<Value> {
         let id = self.next_id();
         let mut arguments = json!({
-            "operation": "api",
             "endpoint": endpoint
         });
         if let Some(jq_expr) = jq {
@@ -223,7 +222,7 @@ impl McpSession {
             "jsonrpc": "2.0",
             "method": "tools/call",
             "params": {
-                "name": "github",
+                "name": "github_api_tool",
                 "arguments": arguments
             },
             "id": id
@@ -250,9 +249,8 @@ impl McpSession {
                 "jsonrpc": "2.0",
                 "method": "tools/call",
                 "params": {
-                    "name": "github",
+                    "name": "github_api_tool",
                     "arguments": {
-                        "operation": "api",
                         "endpoint": "invalid-test-call"
                     }
                 },
@@ -262,7 +260,7 @@ impl McpSession {
         }
     }
 
-    /// Call the github tool's api operation with method and body
+    /// Call the github_api_tool with method and body
     fn call_github_api_with_method(
         &mut self,
         endpoint: &str,
@@ -272,7 +270,6 @@ impl McpSession {
     ) -> Result<Value> {
         let id = self.next_id();
         let mut arguments = json!({
-            "operation": "api",
             "endpoint": endpoint,
             "method": method
         });
@@ -286,7 +283,7 @@ impl McpSession {
             "jsonrpc": "2.0",
             "method": "tools/call",
             "params": {
-                "name": "github",
+                "name": "github_api_tool",
                 "arguments": arguments
             },
             "id": id
@@ -295,7 +292,7 @@ impl McpSession {
         self.send_request(request)
     }
 
-    /// Call the github tool's create-draft-pr operation
+    /// Call the github_create_draft_pr_tool
     fn call_github_create_draft_pr(
         &mut self,
         repo: &str,
@@ -306,7 +303,6 @@ impl McpSession {
     ) -> Result<Value> {
         let id = self.next_id();
         let mut arguments = json!({
-            "operation": "create-draft-pr",
             "repo": repo,
             "head": head,
             "base": base,
@@ -319,7 +315,7 @@ impl McpSession {
             "jsonrpc": "2.0",
             "method": "tools/call",
             "params": {
-                "name": "github",
+                "name": "github_create_draft_pr_tool",
                 "arguments": arguments
             },
             "id": id
@@ -328,7 +324,7 @@ impl McpSession {
         self.send_request(request)
     }
 
-    /// Call the github tool's pending-review operation
+    /// Call the github_pending_review_tool
     fn call_github_pending_review(
         &mut self,
         review_operation: &str,
@@ -339,8 +335,7 @@ impl McpSession {
     ) -> Result<Value> {
         let id = self.next_id();
         let mut arguments = json!({
-            "operation": "pending-review",
-            "review-operation": review_operation,
+            "operation": review_operation,
             "repo": repo,
             "pull_number": pull_number
         });
@@ -354,7 +349,7 @@ impl McpSession {
             "jsonrpc": "2.0",
             "method": "tools/call",
             "params": {
-                "name": "github",
+                "name": "github_pending_review_tool",
                 "arguments": arguments
             },
             "id": id
