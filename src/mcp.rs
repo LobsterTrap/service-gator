@@ -61,184 +61,58 @@ use crate::jira::{self, JiraSubcommand};
 use crate::jira_client::JiraClient;
 use crate::scope::{GhOpType, OpType, ScopeConfig};
 
-/// Input schema for the unified GitHub tool.
+/// Input schema for GitHub API tool.
 ///
-/// This tool provides explicit subcommands for GitHub operations:
-/// - `api`: REST API access (read or write depending on method and permissions)
-/// - `create-draft-pr`: Create a draft pull request
-/// - `pending-review`: Manage pending PR reviews
-///
-/// Note: We manually implement JsonSchema to ensure the root schema has "type": "object",
-/// which is required by some MCP clients (e.g., OpenCode) for tool input validation.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "operation", rename_all = "kebab-case")]
-pub enum GithubToolInput {
-    /// GitHub REST API access.
-    /// Supports both read (GET) and write (POST/PUT/PATCH/DELETE) operations.
-    /// Write operations require write permission for the target repository.
-    Api {
-        /// The API endpoint path (e.g., "repos/owner/repo/pulls")
-        endpoint: String,
-        /// HTTP method: GET (default), POST, PUT, PATCH, DELETE
-        #[serde(default)]
-        method: Option<String>,
-        /// Request body as JSON (for POST/PUT/PATCH)
-        #[serde(default)]
-        body: Option<serde_json::Value>,
-        /// Optional jq expression to filter output
-        #[serde(default)]
-        jq: Option<String>,
-    },
-    /// Create a draft pull request.
-    CreateDraftPr {
-        /// Repository in "owner/repo" format
-        repo: String,
-        /// The branch where your changes are implemented
-        head: String,
-        /// The branch you want the changes pulled into (usually "main")
-        base: String,
-        /// The title of the pull request
-        title: String,
-        /// The body/description of the pull request
-        #[serde(default)]
-        body: Option<String>,
-    },
-    /// Manage pending PR reviews.
-    PendingReview {
-        /// The sub-operation: "list", "create", "get", "update", "delete"
-        #[serde(rename = "review-operation")]
-        review_operation: String,
-        /// Repository in "owner/repo" format
-        repo: String,
-        /// Pull request number
-        pull_number: u64,
-        /// Review ID (required for get/update/delete operations)
-        #[serde(default)]
-        review_id: Option<u64>,
-        /// Review body text (required for create, optional for update)
-        #[serde(default)]
-        body: Option<String>,
-        /// Review comments for create operation
-        #[serde(default)]
-        comments: Option<Vec<ReviewComment>>,
-    },
+/// Provides read/write access to the GitHub REST API.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GithubApiInput {
+    /// The API endpoint path (e.g., "repos/owner/repo/pulls")
+    pub endpoint: String,
+    /// HTTP method: GET (default), POST, PUT, PATCH, DELETE
+    #[serde(default)]
+    pub method: Option<String>,
+    /// Request body as JSON (for POST/PUT/PATCH)
+    #[serde(default)]
+    pub body: Option<serde_json::Value>,
+    /// Optional jq expression to filter output
+    #[serde(default)]
+    pub jq: Option<String>,
 }
 
-/// Custom JsonSchema implementation for GithubToolInput.
-///
-/// The default schemars derive for internally-tagged enums generates a schema with
-/// `oneOf` at the root but without `"type": "object"`. Some MCP clients (OpenCode, VS Code)
-/// require `"type": "object"` at the root level for all tool input schemas.
-///
-/// This implementation wraps the oneOf in an object type schema.
-impl schemars::JsonSchema for GithubToolInput {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        std::borrow::Cow::Borrowed("GithubToolInput")
-    }
+/// Input schema for creating a draft pull request.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GithubCreateDraftPrInput {
+    /// Repository in "owner/repo" format
+    pub repo: String,
+    /// The branch where your changes are implemented
+    pub head: String,
+    /// The branch you want the changes pulled into (usually "main")
+    pub base: String,
+    /// The title of the pull request
+    pub title: String,
+    /// The body/description of the pull request
+    #[serde(default)]
+    pub body: Option<String>,
+}
 
-    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        use serde_json::{json, Map, Value};
-
-        // Pre-generate all the subschemas we need
-        let string_schema: Value =
-            serde_json::to_value(generator.subschema_for::<String>()).unwrap_or(json!({}));
-        let opt_string_schema: Value =
-            serde_json::to_value(generator.subschema_for::<Option<String>>()).unwrap_or(json!({}));
-        let opt_json_schema: Value =
-            serde_json::to_value(generator.subschema_for::<Option<serde_json::Value>>())
-                .unwrap_or(json!({}));
-        let u64_schema: Value =
-            serde_json::to_value(generator.subschema_for::<u64>()).unwrap_or(json!({}));
-        let opt_u64_schema: Value =
-            serde_json::to_value(generator.subschema_for::<Option<u64>>()).unwrap_or(json!({}));
-        let opt_comments_schema: Value =
-            serde_json::to_value(generator.subschema_for::<Option<Vec<ReviewComment>>>())
-                .unwrap_or(json!({}));
-
-        // Helper to create a variant schema with the operation tag
-        fn variant_schema(
-            operation: &str,
-            properties: Vec<(&str, Value, bool)>, // (name, schema, required)
-            description: &str,
-        ) -> Value {
-            let mut props = Map::new();
-            let mut required = vec!["operation".to_string()];
-
-            // Add the operation discriminator
-            props.insert(
-                "operation".to_string(),
-                json!({
-                    "type": "string",
-                    "const": operation
-                }),
-            );
-
-            // Add each property
-            for (name, schema, is_required) in properties {
-                props.insert(name.to_string(), schema);
-                if is_required {
-                    required.push(name.to_string());
-                }
-            }
-
-            json!({
-                "type": "object",
-                "description": description,
-                "properties": props,
-                "required": required
-            })
-        }
-
-        // Build schema for each variant
-        let api_variant = variant_schema(
-            "api",
-            vec![
-                ("endpoint", string_schema.clone(), true),
-                ("method", opt_string_schema.clone(), false),
-                ("body", opt_json_schema, false),
-                ("jq", opt_string_schema.clone(), false),
-            ],
-            "GitHub REST API access. Supports GET, POST, PUT, PATCH, DELETE methods.",
-        );
-
-        let create_draft_pr_variant = variant_schema(
-            "create-draft-pr",
-            vec![
-                ("repo", string_schema.clone(), true),
-                ("head", string_schema.clone(), true),
-                ("base", string_schema.clone(), true),
-                ("title", string_schema.clone(), true),
-                ("body", opt_string_schema.clone(), false),
-            ],
-            "Create a draft pull request.",
-        );
-
-        let pending_review_variant = variant_schema(
-            "pending-review",
-            vec![
-                ("review-operation", string_schema.clone(), true),
-                ("repo", string_schema, true),
-                ("pull_number", u64_schema, true),
-                ("review_id", opt_u64_schema, false),
-                ("body", opt_string_schema, false),
-                ("comments", opt_comments_schema, false),
-            ],
-            "Manage pending PR reviews. Operations: list, create, get, update, delete.",
-        );
-
-        // Build the root schema with type: object AND oneOf
-        let schema_value = json!({
-            "type": "object",
-            "oneOf": [
-                api_variant,
-                create_draft_pr_variant,
-                pending_review_variant
-            ]
-        });
-
-        // Convert to Schema
-        schema_value.try_into().expect("valid schema object")
-    }
+/// Input schema for managing pending PR reviews.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GithubPendingReviewInput {
+    /// The operation to perform: "list", "create", "get", "update", "delete"
+    pub operation: String,
+    /// Repository in "owner/repo" format
+    pub repo: String,
+    /// Pull request number
+    pub pull_number: u64,
+    /// Review ID (required for get/update/delete operations)
+    #[serde(default)]
+    pub review_id: Option<u64>,
+    /// Review body text (required for create, optional for update)
+    #[serde(default)]
+    pub body: Option<String>,
+    /// Review comments for create operation
+    #[serde(default)]
+    pub comments: Option<Vec<ReviewComment>>,
 }
 
 /// Input schema for GitLab CLI tool.
@@ -449,8 +323,8 @@ impl ServiceGatorServer {
         Ok(result)
     }
 
-    /// Handle the `api` operation of the github tool.
-    async fn github_api(
+    /// Handle the GitHub API operation.
+    async fn github_api_impl(
         &self,
         config: &ScopeConfig,
         endpoint: &str,
@@ -565,8 +439,8 @@ impl ServiceGatorServer {
         }
     }
 
-    /// Handle the `create-draft-pr` operation of the github tool.
-    async fn github_create_draft_pr(
+    /// Handle creating a draft pull request.
+    async fn github_create_draft_pr_impl(
         &self,
         config: &ScopeConfig,
         repo: &str,
@@ -612,9 +486,9 @@ impl ServiceGatorServer {
         }
     }
 
-    /// Handle the `pending-review` operation of the github tool.
+    /// Handle pending review operations.
     #[allow(clippy::too_many_arguments)]
-    async fn github_pending_review(
+    async fn github_pending_review_impl(
         &self,
         config: &ScopeConfig,
         operation: &str,
@@ -803,64 +677,78 @@ impl ServiceGatorServer {
 /// Tool definitions for the MCP server.
 #[tool_router]
 impl ServiceGatorServer {
-    /// Unified GitHub tool with explicit subcommands.
+    /// GitHub REST API access.
     ///
-    /// Operations:
-    /// - `api`: Read-only REST API access
-    /// - `create-draft-pr`: Create a draft pull request
-    /// - `pending-review`: Manage pending PR reviews
-    #[tool(description = "GitHub operations with explicit subcommands. \
-        Use 'api' for read-only REST API access (endpoint like 'repos/owner/repo/pulls'). \
-        Use 'create-draft-pr' to create a draft pull request (requires create-draft permission). \
-        Use 'pending-review' to manage pending PR reviews (requires pending-review permission). \
+    /// Supports both read (GET) and write (POST/PUT/PATCH/DELETE) operations.
+    /// Write operations require appropriate permissions for the target repository.
+    #[tool(description = "GitHub REST API access. \
+        Use endpoint like 'repos/owner/repo/pulls' for repository operations. \
+        Supports GET (default), POST, PUT, PATCH, DELETE methods. \
+        Write operations require write permission for the target repository. \
         Use the 'status' tool to view your current permissions.")]
-    async fn github(
+    async fn github_api_tool(
         &self,
         Extension(parts): Extension<http::request::Parts>,
-        Parameters(input): Parameters<GithubToolInput>,
+        Parameters(input): Parameters<GithubApiInput>,
     ) -> Result<CallToolResult, McpError> {
         let config = get_scopes_from_parts(&parts)?;
+        self.github_api_impl(
+            &config,
+            &input.endpoint,
+            input.method.as_deref(),
+            input.body,
+            input.jq.as_deref(),
+        )
+        .await
+    }
 
-        match input {
-            GithubToolInput::Api {
-                endpoint,
-                method,
-                body,
-                jq,
-            } => {
-                self.github_api(&config, &endpoint, method.as_deref(), body, jq.as_deref())
-                    .await
-            }
-            GithubToolInput::CreateDraftPr {
-                repo,
-                head,
-                base,
-                title,
-                body,
-            } => {
-                self.github_create_draft_pr(&config, &repo, &head, &base, &title, body.as_deref())
-                    .await
-            }
-            GithubToolInput::PendingReview {
-                review_operation,
-                repo,
-                pull_number,
-                review_id,
-                body,
-                comments,
-            } => {
-                self.github_pending_review(
-                    &config,
-                    &review_operation,
-                    &repo,
-                    pull_number,
-                    review_id,
-                    body.as_deref(),
-                    comments,
-                )
-                .await
-            }
-        }
+    /// Create a draft pull request on GitHub.
+    ///
+    /// Requires create-draft permission for the target repository.
+    #[tool(description = "Create a draft pull request on GitHub. \
+        Requires create-draft permission for the target repository. \
+        Use the 'status' tool to view your current permissions.")]
+    async fn github_create_draft_pr_tool(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(input): Parameters<GithubCreateDraftPrInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let config = get_scopes_from_parts(&parts)?;
+        self.github_create_draft_pr_impl(
+            &config,
+            &input.repo,
+            &input.head,
+            &input.base,
+            &input.title,
+            input.body.as_deref(),
+        )
+        .await
+    }
+
+    /// Manage pending PR reviews on GitHub.
+    ///
+    /// Supports operations: list, create, get, update, delete.
+    /// Requires pending-review permission for the target repository.
+    #[tool(description = "Manage pending PR reviews on GitHub. \
+        Operations: list, create, get, update, delete. \
+        Requires pending-review permission for the target repository. \
+        Use the 'status' tool to view your current permissions.")]
+    async fn github_pending_review_tool(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(input): Parameters<GithubPendingReviewInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let config = get_scopes_from_parts(&parts)?;
+        self.github_pending_review_impl(
+            &config,
+            &input.operation,
+            &input.repo,
+            input.pull_number,
+            input.review_id,
+            input.body.as_deref(),
+            input.comments,
+        )
+        .await
     }
 
     /// Execute a GitLab API command within configured scopes.
@@ -1288,7 +1176,9 @@ impl ServerHandler for ServiceGatorServer {
                  \
                  Available tools: \
                  - status: Overall service availability and authentication status \
-                 - github: GitHub operations with subcommands: api (read-only), create-draft-pr, pending-review \
+                 - github_api_tool: GitHub REST API access (read/write depending on permissions) \
+                 - github_create_draft_pr_tool: Create draft pull requests on GitHub \
+                 - github_pending_review_tool: Manage pending PR reviews on GitHub \
                  - gl: GitLab API access (scope-restricted: read/draft-mr/approve/write permissions) \
                  - forgejo: Forgejo/Gitea API access (scope-restricted: read/draft-pr/pending-review/write permissions) \
                  - jira: JIRA operations (scope-restricted: read/create/write permissions) \
