@@ -67,7 +67,10 @@ use crate::scope::{GhOpType, OpType, ScopeConfig};
 /// - `api`: REST API access (read or write depending on method and permissions)
 /// - `create-draft-pr`: Create a draft pull request
 /// - `pending-review`: Manage pending PR reviews
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+///
+/// Note: We manually implement JsonSchema to ensure the root schema has "type": "object",
+/// which is required by some MCP clients (e.g., OpenCode) for tool input validation.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "operation", rename_all = "kebab-case")]
 pub enum GithubToolInput {
     /// GitHub REST API access.
@@ -119,6 +122,123 @@ pub enum GithubToolInput {
         #[serde(default)]
         comments: Option<Vec<ReviewComment>>,
     },
+}
+
+/// Custom JsonSchema implementation for GithubToolInput.
+///
+/// The default schemars derive for internally-tagged enums generates a schema with
+/// `oneOf` at the root but without `"type": "object"`. Some MCP clients (OpenCode, VS Code)
+/// require `"type": "object"` at the root level for all tool input schemas.
+///
+/// This implementation wraps the oneOf in an object type schema.
+impl schemars::JsonSchema for GithubToolInput {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("GithubToolInput")
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        use serde_json::{json, Map, Value};
+
+        // Pre-generate all the subschemas we need
+        let string_schema: Value =
+            serde_json::to_value(generator.subschema_for::<String>()).unwrap_or(json!({}));
+        let opt_string_schema: Value =
+            serde_json::to_value(generator.subschema_for::<Option<String>>()).unwrap_or(json!({}));
+        let opt_json_schema: Value =
+            serde_json::to_value(generator.subschema_for::<Option<serde_json::Value>>())
+                .unwrap_or(json!({}));
+        let u64_schema: Value =
+            serde_json::to_value(generator.subschema_for::<u64>()).unwrap_or(json!({}));
+        let opt_u64_schema: Value =
+            serde_json::to_value(generator.subschema_for::<Option<u64>>()).unwrap_or(json!({}));
+        let opt_comments_schema: Value =
+            serde_json::to_value(generator.subschema_for::<Option<Vec<ReviewComment>>>())
+                .unwrap_or(json!({}));
+
+        // Helper to create a variant schema with the operation tag
+        fn variant_schema(
+            operation: &str,
+            properties: Vec<(&str, Value, bool)>, // (name, schema, required)
+            description: &str,
+        ) -> Value {
+            let mut props = Map::new();
+            let mut required = vec!["operation".to_string()];
+
+            // Add the operation discriminator
+            props.insert(
+                "operation".to_string(),
+                json!({
+                    "type": "string",
+                    "const": operation
+                }),
+            );
+
+            // Add each property
+            for (name, schema, is_required) in properties {
+                props.insert(name.to_string(), schema);
+                if is_required {
+                    required.push(name.to_string());
+                }
+            }
+
+            json!({
+                "type": "object",
+                "description": description,
+                "properties": props,
+                "required": required
+            })
+        }
+
+        // Build schema for each variant
+        let api_variant = variant_schema(
+            "api",
+            vec![
+                ("endpoint", string_schema.clone(), true),
+                ("method", opt_string_schema.clone(), false),
+                ("body", opt_json_schema, false),
+                ("jq", opt_string_schema.clone(), false),
+            ],
+            "GitHub REST API access. Supports GET, POST, PUT, PATCH, DELETE methods.",
+        );
+
+        let create_draft_pr_variant = variant_schema(
+            "create-draft-pr",
+            vec![
+                ("repo", string_schema.clone(), true),
+                ("head", string_schema.clone(), true),
+                ("base", string_schema.clone(), true),
+                ("title", string_schema.clone(), true),
+                ("body", opt_string_schema.clone(), false),
+            ],
+            "Create a draft pull request.",
+        );
+
+        let pending_review_variant = variant_schema(
+            "pending-review",
+            vec![
+                ("review-operation", string_schema.clone(), true),
+                ("repo", string_schema, true),
+                ("pull_number", u64_schema, true),
+                ("review_id", opt_u64_schema, false),
+                ("body", opt_string_schema, false),
+                ("comments", opt_comments_schema, false),
+            ],
+            "Manage pending PR reviews. Operations: list, create, get, update, delete.",
+        );
+
+        // Build the root schema with type: object AND oneOf
+        let schema_value = json!({
+            "type": "object",
+            "oneOf": [
+                api_variant,
+                create_draft_pr_variant,
+                pending_review_variant
+            ]
+        });
+
+        // Convert to Schema
+        schema_value.try_into().expect("valid schema object")
+    }
 }
 
 /// Input schema for GitLab CLI tool.
