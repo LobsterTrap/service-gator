@@ -21,6 +21,7 @@ use service_gator::github;
 use service_gator::gitlab;
 use service_gator::jira::{self, IssueAction, JiraSubcommand, ProjectAction, VersionAction};
 use service_gator::jira_client::JiraClient;
+use service_gator::jira_types::JiraProjectKey;
 use service_gator::scope::{
     ForgejoRepoPermission, ForgejoScope, GhRepoPermission, GlProjectPermission,
     JiraProjectPermission, ScopeConfig,
@@ -139,6 +140,13 @@ fn main() -> ExitCode {
     // and exported to the environment for child processes (gh, glab, tea, etc.).
     init_secrets_from_files();
 
+    // Configure git to trust all directories. This is necessary when accessing
+    // workspace repositories that are mounted from a volume owned by a different uid
+    // (e.g., agent workspace running as uid 1000, service-gator running as root).
+    // The "-c safe.directory=*" flag doesn't work because safe.directory is checked
+    // before command-line config is processed.
+    configure_git_safe_directory();
+
     init_tracing();
 
     match try_main() {
@@ -181,6 +189,20 @@ fn read_secret_file(path: &Path) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Configure git to trust all directories via global config.
+///
+/// This is necessary for git_push_local to fetch commits from workspace
+/// repositories that may be owned by a different uid. Git's "dubious ownership"
+/// check rejects repositories not owned by the current user, but we need to
+/// read from agent workspaces mounted as volumes.
+fn configure_git_safe_directory() {
+    // Best effort - if git isn't available or config fails, we'll get a clearer
+    // error later when the actual git operation fails
+    let _ = std::process::Command::new("git")
+        .args(["config", "--global", "--add", "safe.directory", "*"])
+        .status();
 }
 
 fn try_main() -> Result<ExitCode> {
@@ -411,10 +433,15 @@ fn parse_gh_repo_spec(spec: &str) -> Result<(String, GhRepoPermission)> {
 }
 
 /// Parse a --jira-project spec like "PROJ:read,create"
-fn parse_jira_project_spec(spec: &str) -> Result<(String, JiraProjectPermission)> {
+fn parse_jira_project_spec(spec: &str) -> Result<(JiraProjectKey, JiraProjectPermission)> {
     let (project, perms_str) = spec
         .split_once(':')
         .ok_or_else(|| eyre::eyre!("expected format PROJECT:PERMS (e.g., MYPROJ:read)"))?;
+
+    // Validate project key
+    let project_key: JiraProjectKey = project
+        .parse()
+        .map_err(|e| eyre::eyre!("invalid project key '{}': {}", project, e))?;
 
     let mut perm = JiraProjectPermission::default();
     for p in perms_str.split(',') {
@@ -427,7 +454,7 @@ fn parse_jira_project_spec(spec: &str) -> Result<(String, JiraProjectPermission)
         }
     }
 
-    Ok((project.to_string(), perm))
+    Ok((project_key, perm))
 }
 
 /// Parse a --gitlab-project spec like "group/project:read,create-draft"
@@ -1086,7 +1113,11 @@ fn run_jira(config: &ScopeConfig, args: Vec<String>) -> Result<ExitCode> {
             }
         };
 
-        let project_perms = config.jira.projects.get(project_key);
+        // Parse the project key string into a typed key for lookup
+        let project_key_typed = project_key.parse::<JiraProjectKey>().ok();
+        let project_perms = project_key_typed
+            .as_ref()
+            .and_then(|k| config.jira.projects.get(k));
         let allowed = match op_type {
             service_gator::scope::OpType::Read => {
                 project_perms.map(|p| p.can_read()).unwrap_or(false)
@@ -1094,8 +1125,15 @@ fn run_jira(config: &ScopeConfig, args: Vec<String>) -> Result<ExitCode> {
             service_gator::scope::OpType::Write => {
                 // Check for issue-specific permissions first
                 if let Some(issue) = &validated.issue {
-                    if let Some(issue_perm) = config.jira.issues.get(issue) {
-                        if issue_perm.write {
+                    // Parse issue key for typed lookup
+                    let issue_key_typed = issue
+                        .parse::<service_gator::jira_types::JiraIssueKey>()
+                        .ok();
+                    let issue_perm = issue_key_typed
+                        .as_ref()
+                        .and_then(|k| config.jira.issues.get(k));
+                    if let Some(perm) = issue_perm {
+                        if perm.write {
                             true
                         } else {
                             project_perms.map(|p| p.can_write()).unwrap_or(false)
@@ -1125,8 +1163,8 @@ fn run_jira(config: &ScopeConfig, args: Vec<String>) -> Result<ExitCode> {
     // Create the JIRA client and execute
     // Use bearer auth if no username, otherwise basic auth
     let client = match &username {
-        Some(user) => JiraClient::new(&host, user, &token),
-        None => JiraClient::with_bearer_token(&host, &token),
+        Some(user) => JiraClient::new(&host, user, token.expose_secret()),
+        None => JiraClient::with_bearer_token(&host, token.expose_secret()),
     }
     .context("Failed to create JIRA client")?;
 
@@ -1156,20 +1194,21 @@ async fn execute_jira_command(
     match &validated.command.command {
         JiraSubcommand::Issue(issue_cmd) => match &issue_cmd.action {
             IssueAction::List(args) => {
-                let results = client.list_issues(&args.project).await?;
+                let results = client.list_issues(args.project.as_str()).await?;
                 Ok(serde_json::to_string_pretty(&results)?)
             }
             IssueAction::Show(args) => {
                 let issue_key = args
                     .effective_issue()
                     .ok_or_else(|| eyre::eyre!("Issue key required"))?;
-                let issue = client.get_issue(issue_key).await?;
+                let issue_key_str = issue_key.to_string();
+                let issue = client.get_issue(&issue_key_str).await?;
                 Ok(serde_json::to_string_pretty(&issue)?)
             }
             IssueAction::Create(args) => {
                 let created = client
                     .create_issue(
-                        &args.project,
+                        args.project.as_str(),
                         &args.summary,
                         args.description.as_deref(),
                         args.issue_type.as_deref(),
@@ -1186,10 +1225,13 @@ async fn execute_jira_command(
                 let issue_key = args
                     .effective_issue()
                     .ok_or_else(|| eyre::eyre!("Issue key required"))?;
+                let issue_key_str = issue_key.to_string();
 
                 match &args.transition {
                     Some(transition_name) => {
-                        client.transition_issue(issue_key, transition_name).await?;
+                        client
+                            .transition_issue(&issue_key_str, transition_name)
+                            .await?;
                         Ok(format!(
                             "Successfully transitioned {} to {}",
                             issue_key, transition_name
@@ -1197,7 +1239,7 @@ async fn execute_jira_command(
                     }
                     None => {
                         // List available transitions
-                        let transitions = client.get_transitions(issue_key).await?;
+                        let transitions = client.get_transitions(&issue_key_str).await?;
                         Ok(serde_json::to_string_pretty(&transitions)?)
                     }
                 }
@@ -1206,8 +1248,9 @@ async fn execute_jira_command(
                 let issue_key = args
                     .effective_issue()
                     .ok_or_else(|| eyre::eyre!("Issue key required"))?;
+                let issue_key_str = issue_key.to_string();
                 client
-                    .assign_issue(issue_key, args.assignee.as_deref())
+                    .assign_issue(&issue_key_str, args.assignee.as_deref())
                     .await?;
                 match &args.assignee {
                     Some(user) => Ok(format!("Successfully assigned {} to {}", issue_key, user)),
@@ -1223,7 +1266,7 @@ async fn execute_jira_command(
         },
         JiraSubcommand::Version(version_cmd) => match &version_cmd.action {
             VersionAction::List(args) => {
-                let versions = client.list_versions(&args.project).await?;
+                let versions = client.list_versions(args.project.as_str()).await?;
                 Ok(serde_json::to_string_pretty(&versions)?)
             }
         },

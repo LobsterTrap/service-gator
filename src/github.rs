@@ -32,6 +32,19 @@
 //! - `-F` / `--field @file`: File reading via `@` prefix (we only allow `-f`)
 //! - `--hostname`: Could exfiltrate tokens to malicious server
 //! - `--method` / `-X`: Method is controlled by us (GET for REST, POST for GraphQL)
+//!
+//! ## Branch Management for Sandboxed AI Agents
+//!
+//! When running in devaipod, AI agents are sandboxed without git credentials.
+//! Two MCP tools provide safe branch management:
+//!
+//! - `gh_create_branch`: Creates NEW branches with enforced `agent-` prefix naming.
+//!   Requires `create-draft` permission. Branches must not already exist.
+//!
+//! - `gh_update_pr_head`: Updates an existing PR's branch. The branch name is looked
+//!   up from the PR number - agents cannot specify arbitrary branch names.
+//!
+//! See `src/mcp.rs` for the implementation.
 
 use std::process::Command;
 
@@ -42,6 +55,7 @@ use serde_json;
 use graphql_parser::query::{Definition, OperationDefinition};
 use itertools::Itertools;
 
+use crate::git::PullRequestNumber;
 use crate::scope::{GhOpType, OpType};
 
 /// Parse a key=value pair for the -f/--field option.
@@ -239,7 +253,7 @@ pub struct PendingReviewRequest {
     /// The target repository (owner/repo).
     pub repo: String,
     /// The pull request number.
-    pub pull_number: u64,
+    pub pull_number: PullRequestNumber,
     /// The review ID (if targeting a specific review).
     pub review_id: Option<u64>,
     /// The operation to perform.
@@ -333,7 +347,7 @@ pub fn parse_pending_review_request(
 
     let (pull_str, rest) = rest.split_once('/').unwrap_or((rest, ""));
 
-    let pull_number: u64 = pull_str
+    let pull_number: PullRequestNumber = pull_str
         .parse()
         .map_err(|_| eyre::eyre!("Invalid pull request number: {}", pull_str))?;
 
@@ -2207,7 +2221,7 @@ mod tests {
         let req =
             parse_pending_review_request("repos/owner/repo/pulls/42/reviews", "GET", None).unwrap();
         assert_eq!(req.repo, "owner/repo");
-        assert_eq!(req.pull_number, 42);
+        assert_eq!(req.pull_number.get(), 42);
         assert_eq!(req.review_id, None);
         assert_eq!(req.op, PendingReviewOp::List);
     }
@@ -2218,7 +2232,7 @@ mod tests {
             parse_pending_review_request("repos/owner/repo/pulls/42/reviews/123", "GET", None)
                 .unwrap();
         assert_eq!(req.repo, "owner/repo");
-        assert_eq!(req.pull_number, 42);
+        assert_eq!(req.pull_number.get(), 42);
         assert_eq!(req.review_id, Some(123));
         assert_eq!(req.op, PendingReviewOp::Get);
     }
@@ -2333,7 +2347,7 @@ mod tests {
     fn test_pending_review_request_build_args() {
         let req = PendingReviewRequest {
             repo: "owner/repo".into(),
-            pull_number: 42,
+            pull_number: 42.try_into().unwrap(),
             review_id: None,
             op: PendingReviewOp::Create,
             body: Some(serde_json::json!({"body": "test"})),
@@ -2347,7 +2361,7 @@ mod tests {
     fn test_pending_review_request_build_args_with_id() {
         let req = PendingReviewRequest {
             repo: "owner/repo".into(),
-            pull_number: 42,
+            pull_number: 42.try_into().unwrap(),
             review_id: Some(123),
             op: PendingReviewOp::Delete,
             body: None,
