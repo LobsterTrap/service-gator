@@ -35,10 +35,15 @@ validate:
     cargo fmt -- --check
     cargo clippy -- -D warnings
 
-# Matches default GHA run
+# Matches default GHA run (without Kani - use ci-full for complete verification)
 [group('core')]
-ci: validate build test kani test-integration
+ci: validate build test test-integration
     @echo "All CI checks passed!"
+
+# Full CI including Kani formal verification (requires Kani installation)
+[group('core')]
+ci-full: validate build test kani test-integration
+    @echo "All CI checks (including Kani) passed!"
 
 # ============================================================================
 # Development utilities

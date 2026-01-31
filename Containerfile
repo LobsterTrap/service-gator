@@ -21,7 +21,7 @@ cp target/release/service-gator /out/usr/bin/
 chmod 0755 /out/usr/bin/service-gator
 EORUN
 
-# Download CLI tools that service-gator wraps (not available in UBI)
+# Download CLI tools that service-gator wraps
 FROM registry.access.redhat.com/ubi10/ubi:latest AS tools
 WORKDIR /tools
 RUN <<EORUN
@@ -35,6 +35,8 @@ case "$ARCH" in
     aarch64) ARCH_SUFFIX="arm64"; TEA_ARCH="linux-arm64" ;;
     *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
+
+# TODO update these via renovate
 
 # GitHub CLI
 GH_VERSION="2.67.0"
@@ -54,13 +56,16 @@ EORUN
 
 # Runtime stage: minimal UBI10 image
 FROM registry.access.redhat.com/ubi10/ubi-minimal:latest
+RUN <<EORUN
+set -xeuo pipefail
+# Needed for push proxying
+microdnf -y install git-core
+microdnf clean all
+EORUN
 
-# Copy the binary from builder
+COPY --from=tools /tools/* /usr/bin/
+
+# And our built binary
 COPY --from=builder /out/usr/bin/service-gator /usr/bin/
-
-# Copy CLI tools
-COPY --from=tools /tools/gh /usr/bin/
-COPY --from=tools /tools/glab /usr/bin/
-COPY --from=tools /tools/tea /usr/bin/
 
 ENTRYPOINT ["service-gator"]

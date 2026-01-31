@@ -1,0 +1,16 @@
+# Exclude everything by default, then include just what we need
+# Especially note this means that .git is not included, and not tests/
+# to avoid spurious rebuilds.
+*
+
+# Toplevel build bits
+!Makefile
+!Cargo.*
+!LICENSE-*
+# Workaround for podman bug with secrets + remote
+# https://github.com/containers/podman/issues/25314
+!podman-build-secret*
+# And finally of course all the Rust sources
+!src/
+# Workspace members
+!integration-tests/

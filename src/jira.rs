@@ -20,6 +20,7 @@
 use clap::{Parser, Subcommand};
 use eyre::{bail, Result};
 
+use crate::jira_types::{JiraIssueKey, JiraProjectKey};
 use crate::scope::OpType;
 
 // ============================================================================
@@ -80,7 +81,7 @@ pub enum IssueAction {
 pub struct IssueListArgs {
     /// Project key
     #[arg(short = 'p', long = "project")]
-    pub project: String,
+    pub project: JiraProjectKey,
 
     /// Output format (json, table)
     #[arg(short = 'o', long = "output")]
@@ -91,11 +92,11 @@ pub struct IssueListArgs {
 pub struct IssueShowArgs {
     /// Issue key (e.g., PROJ-123)
     #[arg(short = 'i', long = "issue")]
-    pub issue: Option<String>,
+    pub issue: Option<JiraIssueKey>,
 
     /// Issue key as positional argument
     #[arg()]
-    pub issue_key: Option<String>,
+    pub issue_key: Option<JiraIssueKey>,
 
     /// Output format (json, table)
     #[arg(short = 'o', long = "output")]
@@ -104,8 +105,8 @@ pub struct IssueShowArgs {
 
 impl IssueShowArgs {
     /// Get the effective issue key from either flag or positional
-    pub fn effective_issue(&self) -> Option<&str> {
-        self.issue.as_deref().or(self.issue_key.as_deref())
+    pub fn effective_issue(&self) -> Option<&JiraIssueKey> {
+        self.issue.as_ref().or(self.issue_key.as_ref())
     }
 }
 
@@ -113,7 +114,7 @@ impl IssueShowArgs {
 pub struct IssueCreateArgs {
     /// Project key
     #[arg(short = 'p', long = "project")]
-    pub project: String,
+    pub project: JiraProjectKey,
 
     /// Issue summary/title
     #[arg(short = 's', long = "summary")]
@@ -136,11 +137,11 @@ pub struct IssueCreateArgs {
 pub struct IssueTransitionArgs {
     /// Issue key (e.g., PROJ-123)
     #[arg(short = 'i', long = "issue")]
-    pub issue: Option<String>,
+    pub issue: Option<JiraIssueKey>,
 
     /// Issue key as positional argument
     #[arg()]
-    pub issue_key: Option<String>,
+    pub issue_key: Option<JiraIssueKey>,
 
     /// Transition name or ID
     #[arg(short = 't', long = "transition")]
@@ -152,8 +153,8 @@ pub struct IssueTransitionArgs {
 }
 
 impl IssueTransitionArgs {
-    pub fn effective_issue(&self) -> Option<&str> {
-        self.issue.as_deref().or(self.issue_key.as_deref())
+    pub fn effective_issue(&self) -> Option<&JiraIssueKey> {
+        self.issue.as_ref().or(self.issue_key.as_ref())
     }
 }
 
@@ -161,11 +162,11 @@ impl IssueTransitionArgs {
 pub struct IssueAssignArgs {
     /// Issue key (e.g., PROJ-123)
     #[arg(short = 'i', long = "issue")]
-    pub issue: Option<String>,
+    pub issue: Option<JiraIssueKey>,
 
     /// Issue key as positional argument
     #[arg()]
-    pub issue_key: Option<String>,
+    pub issue_key: Option<JiraIssueKey>,
 
     /// Assignee username or account ID
     #[arg(short = 'a', long = "assignee")]
@@ -177,8 +178,8 @@ pub struct IssueAssignArgs {
 }
 
 impl IssueAssignArgs {
-    pub fn effective_issue(&self) -> Option<&str> {
-        self.issue.as_deref().or(self.issue_key.as_deref())
+    pub fn effective_issue(&self) -> Option<&JiraIssueKey> {
+        self.issue.as_ref().or(self.issue_key.as_ref())
     }
 }
 
@@ -225,7 +226,7 @@ pub enum VersionAction {
 pub struct VersionListArgs {
     /// Project key
     #[arg(short = 'p', long = "project")]
-    pub project: String,
+    pub project: JiraProjectKey,
 
     /// Output format (json, table)
     #[arg(short = 'o', long = "output")]
@@ -330,41 +331,44 @@ fn extract_metadata(cmd: &JiraCommand) -> (Option<String>, Option<String>, Strin
     match &cmd.command {
         JiraSubcommand::Issue(issue_cmd) => match &issue_cmd.action {
             IssueAction::List(args) => (
-                Some(args.project.clone()),
+                Some(args.project.as_str().to_string()),
                 None,
                 format!("jira issue list -p {}", args.project),
             ),
             IssueAction::Show(args) => {
-                let issue = args.effective_issue().map(String::from);
-                let project = issue.as_ref().and_then(|i| project_from_issue(i));
-                let desc = match &issue {
+                let issue = args.effective_issue();
+                let project = issue.map(|i| i.project().to_string());
+                let issue_str = issue.map(|i| i.to_string());
+                let desc = match issue {
                     Some(i) => format!("jira issue show {}", i),
                     None => "jira issue show".to_string(),
                 };
-                (project, issue, desc)
+                (project, issue_str, desc)
             }
             IssueAction::Create(args) => (
-                Some(args.project.clone()),
+                Some(args.project.as_str().to_string()),
                 None,
                 format!("jira issue create -p {}", args.project),
             ),
             IssueAction::Transition(args) => {
-                let issue = args.effective_issue().map(String::from);
-                let project = issue.as_ref().and_then(|i| project_from_issue(i));
-                let desc = match &issue {
+                let issue = args.effective_issue();
+                let project = issue.map(|i| i.project().to_string());
+                let issue_str = issue.map(|i| i.to_string());
+                let desc = match issue {
                     Some(i) => format!("jira issue transition {}", i),
                     None => "jira issue transition".to_string(),
                 };
-                (project, issue, desc)
+                (project, issue_str, desc)
             }
             IssueAction::Assign(args) => {
-                let issue = args.effective_issue().map(String::from);
-                let project = issue.as_ref().and_then(|i| project_from_issue(i));
-                let desc = match &issue {
+                let issue = args.effective_issue();
+                let project = issue.map(|i| i.project().to_string());
+                let issue_str = issue.map(|i| i.to_string());
+                let desc = match issue {
                     Some(i) => format!("jira issue assign {}", i),
                     None => "jira issue assign".to_string(),
                 };
-                (project, issue, desc)
+                (project, issue_str, desc)
             }
         },
         JiraSubcommand::Project(project_cmd) => match &project_cmd.action {
@@ -372,7 +376,7 @@ fn extract_metadata(cmd: &JiraCommand) -> (Option<String>, Option<String>, Strin
         },
         JiraSubcommand::Version(version_cmd) => match &version_cmd.action {
             VersionAction::List(args) => (
-                Some(args.project.clone()),
+                Some(args.project.as_str().to_string()),
                 None,
                 format!("jira version list -p {}", args.project),
             ),
@@ -395,7 +399,7 @@ pub fn build_command_args(cmd: &ValidatedJiraCommand) -> Vec<String> {
                     "issue".to_string(),
                     "list".to_string(),
                     "-p".to_string(),
-                    args.project.clone(),
+                    args.project.to_string(),
                 ];
                 if let Some(ref output) = args.output {
                     result.push("-o".to_string());
@@ -405,7 +409,7 @@ pub fn build_command_args(cmd: &ValidatedJiraCommand) -> Vec<String> {
             }
             IssueAction::Show(args) => {
                 let mut result = vec!["issue".to_string(), "show".to_string()];
-                if let Some(ref issue) = args.effective_issue() {
+                if let Some(issue) = args.effective_issue() {
                     result.push("-i".to_string());
                     result.push(issue.to_string());
                 }
@@ -420,7 +424,7 @@ pub fn build_command_args(cmd: &ValidatedJiraCommand) -> Vec<String> {
                     "issue".to_string(),
                     "create".to_string(),
                     "-p".to_string(),
-                    args.project.clone(),
+                    args.project.to_string(),
                     "-s".to_string(),
                     args.summary.clone(),
                 ];
@@ -440,7 +444,7 @@ pub fn build_command_args(cmd: &ValidatedJiraCommand) -> Vec<String> {
             }
             IssueAction::Transition(args) => {
                 let mut result = vec!["issue".to_string(), "transition".to_string()];
-                if let Some(ref issue) = args.effective_issue() {
+                if let Some(issue) = args.effective_issue() {
                     result.push("-i".to_string());
                     result.push(issue.to_string());
                 }
@@ -456,7 +460,7 @@ pub fn build_command_args(cmd: &ValidatedJiraCommand) -> Vec<String> {
             }
             IssueAction::Assign(args) => {
                 let mut result = vec!["issue".to_string(), "assign".to_string()];
-                if let Some(ref issue) = args.effective_issue() {
+                if let Some(issue) = args.effective_issue() {
                     result.push("-i".to_string());
                     result.push(issue.to_string());
                 }
@@ -487,7 +491,7 @@ pub fn build_command_args(cmd: &ValidatedJiraCommand) -> Vec<String> {
                     "version".to_string(),
                     "list".to_string(),
                     "-p".to_string(),
-                    args.project.clone(),
+                    args.project.to_string(),
                 ];
                 if let Some(ref output) = args.output {
                     result.push("-o".to_string());
@@ -531,7 +535,13 @@ pub fn classify_command(cmd: &ValidatedJiraCommand) -> OpType {
 }
 
 /// Extract project key from an issue key like "PROJ-123".
+/// Uses JiraIssueKey for validation when possible, falls back to simple parsing.
 fn project_from_issue(issue: &str) -> Option<String> {
+    // Try using the proper type first
+    if let Ok(key) = issue.parse::<JiraIssueKey>() {
+        return Some(key.project().to_string());
+    }
+    // Fallback for legacy compatibility with looser validation
     let parts: Vec<&str> = issue.splitn(2, '-').collect();
     if parts.len() == 2 && !parts[0].is_empty() && parts[1].chars().all(|c| c.is_ascii_digit()) {
         Some(parts[0].to_uppercase())

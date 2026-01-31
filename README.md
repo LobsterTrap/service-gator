@@ -23,6 +23,7 @@ The recommended deployment is the container image with CLI-based scope configura
 
 ```bash
 # Single repo with read access
+# Note: GITHUB_TOKEN is also accepted as an alternative to GH_TOKEN
 podman run --rm -p 8080:8080 \
   -e GH_TOKEN \
   ghcr.io/cgwalters/service-gator:latest \
@@ -91,7 +92,7 @@ podman run --rm -p 8080:8080 \
   --gh-repo myorg/myrepo:read
 ```
 
-Supported `*_FILE` variables: `GH_TOKEN_FILE`, `GITLAB_TOKEN_FILE`, `FORGEJO_TOKEN_FILE`, `JIRA_API_TOKEN_FILE`, `SERVICE_GATOR_SECRET_FILE`, `SERVICE_GATOR_ADMIN_KEY_FILE`
+Supported `*_FILE` variables: `GH_TOKEN_FILE`, `GITLAB_TOKEN_FILE`, `FORGEJO_TOKEN_FILE`, `GITEA_TOKEN_FILE`, `JIRA_API_TOKEN_FILE`, `SERVICE_GATOR_SECRET_FILE`, `SERVICE_GATOR_ADMIN_KEY_FILE`
 
 ### Kubernetes
 
@@ -139,9 +140,11 @@ stringData:
   admin-key: "your-admin-key"
 ```
 
-## Multi-Tenant Deployment with JWT Tokens
+## Dynamic Reconfiguration with JWT Tokens
 
-For multi-tenant deployments, use JWT tokens to provide per-agent scoping. A single service-gator instance can serve multiple agents, each with different access:
+JWT tokens enable runtime scope changes without restarting service-gator. The primary use case is **human-approved privilege escalation**—an agent starts with minimal access, then a human can grant additional permissions based on demonstrated need or workflow requirements.
+
+For example, [devaipod](https://github.com/cgwalters/devaipod) uses this pattern: an orchestrator could offer `devaipod context add <pod> https://github.com/org/repo` to dynamically add another repository to a running agent's scope after human approval.
 
 ```bash
 # Start server with JWT auth enabled
@@ -192,11 +195,26 @@ curl -X POST http://localhost:8080/token/rotate \
 
 | Tool | Description |
 |------|-------------|
+| `status` | Overall status of all services including authentication status and available tools |
 | `gh` | GitHub REST API (read-only `gh api <endpoint> [--jq]`) |
 | `gh_pending_review` | Pending PR reviews for AI code review workflows |
+| `gh_create_branch` | Create agent branches (enforced `agent-` prefix, requires `create-draft`) |
+| `gh_update_pr_head` | Update a PR's branch by PR number |
+| `git_push_local` | Push local commits from agent workspace to remote |
 | `gl` | GitLab REST API (read-only `glab api <endpoint> [--jq]`) |
 | `forgejo` | Forgejo/Gitea REST API (read-only, wraps `tea`) |
 | `jira` | JIRA CLI within configured scopes |
+
+### Git Push for Sandboxed Agents
+
+The `git_push_local`, `gh_create_branch`, and `gh_update_pr_head` tools enable sandboxed AI agents to push commits without having git credentials inside the sandbox.
+
+**Setup requirements:**
+- The agent needs workspace access with a git clone of the repository
+- service-gator needs `create-draft` permission for the target repo
+- The `git_push_local` tool takes the repo path as a parameter (must be under `/workspaces`)
+
+**Security model:** The agent's repository is untrusted—it may contain malicious hooks or config. The `git_push_local` tool uses a safe pattern: it creates a trusted temporary clone, fetches objects from the agent's repo using `--reference` (which only transfers objects, never executes hooks), then pushes from the trusted clone. Branch creation is restricted to an `agent-` prefix to prevent agents from modifying protected branches.
 
 ## Security Model
 
@@ -227,30 +245,6 @@ The sandboxed agent:
 Here the "outer system" could be anything, but a good way to do
 this is e.g. distinct containers (or a host system with a containerized
 agent), etc.
-
-## Configuration File (Optional)
-
-For complex configurations, create `~/.config/service-gator.toml`:
-
-```toml
-[gh.repos]
-"owner/*" = { read = true }
-"owner/repo" = { read = true, create-draft = true }
-
-[jira.projects]
-"MYPROJ" = { read = true, create = true }
-
-[gitlab.projects]
-"mygroup/*" = { read = true }
-
-[[forgejo]]
-host = "codeberg.org"
-
-[forgejo.repos]
-"user/repo" = { read = true }
-```
-
-CLI options are merged with (and take precedence over) the config file.
 
 ## Installation
 

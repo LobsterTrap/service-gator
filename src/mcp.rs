@@ -30,7 +30,7 @@ use eyre::Result;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::schemars;
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use schemars::JsonSchema;
@@ -55,10 +55,12 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 use crate::forgejo;
 use crate::forgejo_client::{self, ForgejoClient};
+use crate::git::{BranchDescription, CommitSha, PullRequestNumber, RepoName};
 use crate::github::{self, PendingReviewOp, REVIEW_MARKER_TOKEN};
 use crate::gitlab;
 use crate::jira::{self, JiraSubcommand};
 use crate::jira_client::JiraClient;
+use crate::logging::LoggingState;
 use crate::scope::{GhOpType, OpType, ScopeConfig};
 
 /// Input schema for GitHub API tool.
@@ -79,20 +81,40 @@ pub struct GithubApiInput {
     pub jq: Option<String>,
 }
 
-/// Input schema for creating a draft pull request.
+/// Input schema for the combined GitHub push + optional draft PR operation.
+///
+/// This tool pushes a local commit to a remote branch and optionally creates a
+/// draft PR. This is the recommended way to submit work for review on GitHub.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct GithubCreateDraftPrInput {
-    /// Repository in "owner/repo" format
-    pub repo: String,
-    /// The branch where your changes are implemented
-    pub head: String,
-    /// The branch you want the changes pulled into (usually "main")
-    pub base: String,
-    /// The title of the pull request
-    pub title: String,
-    /// The body/description of the pull request
+pub struct GithubPushInput {
+    /// Path to the local git repository (e.g., "/workspaces/myproject")
+    /// Must be under /workspaces.
+    pub repo_path: crate::net::WorkspacePath,
+    /// The commit SHA to push (must exist in the local repo)
+    pub commit_sha: CommitSha,
+    /// GitHub repository in "owner/repo" format
+    pub repo: RepoName,
+    /// Branch description (e.g., "fix-typo"). Will be prefixed with "agent-" automatically.
+    pub description: BranchDescription,
+    /// Whether to create a draft PR after pushing (default: true).
+    /// Set to false if you only want to push the branch without creating a PR.
+    #[serde(default = "default_true")]
+    pub create_draft_pr: bool,
+    /// The branch you want the changes pulled into (usually "main").
+    /// Required when create_draft_pr is true.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// The title of the pull request.
+    /// Required when create_draft_pr is true.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// The body/description of the pull request.
     #[serde(default)]
     pub body: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Input schema for managing pending PR reviews.
@@ -139,6 +161,70 @@ pub struct ForgejoToolInput {
     /// Forgejo host (e.g., "codeberg.org") - required if multiple hosts configured
     #[serde(default)]
     pub host: Option<String>,
+}
+
+/// Input schema for creating a new agent branch on GitHub.
+///
+/// This is for `create-draft` permission level. Branch names are enforced
+/// to start with `agent-` prefix and the branch must NOT already exist.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GhCreateBranchInput {
+    /// Repository in "owner/repo" format
+    pub repo: RepoName,
+    /// The commit SHA to create the branch at
+    pub commit_sha: CommitSha,
+    /// Optional issue number this branch relates to (e.g., 42)
+    /// If provided, branch will be named `agent-42-<description>`
+    #[serde(default)]
+    pub issue_number: Option<u64>,
+    /// Short description for the branch name (e.g., "fix-typo").
+    /// Branch will be named `agent-[issue-]<description>`
+    pub description: BranchDescription,
+}
+
+/// Input schema for updating an existing PR's head branch.
+///
+/// This allows pushing new commits to a PR that the agent has access to.
+/// The agent cannot specify the branch name directly - it's looked up from the PR.
+/// This prevents arbitrary branch manipulation.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GhUpdatePrHeadInput {
+    /// Repository in "owner/repo" format
+    pub repo: RepoName,
+    /// Pull request number
+    pub pull_number: PullRequestNumber,
+    /// The commit SHA to update the PR head to
+    pub commit_sha: CommitSha,
+}
+
+/// Input schema for pushing a local commit to a remote git repository.
+///
+/// This tool safely pushes commits from an agent's local repository to a remote.
+/// It works by creating a temporary trusted clone (using the agent's repo as a
+/// reference for object borrowing) and pushing from there. This avoids executing
+/// any hooks or config from the agent's potentially untrusted repository.
+///
+/// **NOTE**: Requires service-gator to have filesystem access to the agent's repo.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GitPushLocalInput {
+    /// Path to the local git repository (e.g., "/workspaces/myproject")
+    /// Must be under /workspaces.
+    pub repo_path: crate::net::WorkspacePath,
+    /// The commit SHA to push (must exist in the local repo)
+    pub commit_sha: CommitSha,
+    /// Target repository scope in "forge:path" format.
+    ///
+    /// Examples:
+    /// - `github:owner/repo` for GitHub
+    /// - `gitlab:group/project` or `gitlab:group/subgroup/project` for GitLab
+    /// - `forgejo:owner/repo` for Forgejo/Gitea
+    ///
+    /// Must have `create-draft` or higher permission in the corresponding scope.
+    pub target: String,
+    /// Branch name to push to (e.g., "fix-typo").
+    /// Will be prefixed with "agent-" automatically.
+    /// The full branch name will be `agent-<description>`.
+    pub description: BranchDescription,
 }
 
 /// A review comment on a specific file/line.
@@ -195,13 +281,29 @@ fn get_scopes_from_parts(parts: &http::request::Parts) -> Result<ScopeConfig, Mc
 #[derive(Clone)]
 pub struct ServiceGatorServer {
     tool_router: ToolRouter<Self>,
+    logging: LoggingState,
 }
 
 impl ServiceGatorServer {
+    /// Create a new server with default (new) logging state.
     pub fn new() -> Self {
+        Self::with_logging(LoggingState::new())
+    }
+
+    /// Create a new server with shared logging state.
+    ///
+    /// This allows multiple server instances (one per session) to share
+    /// the same logging state for aggregated read operation counting.
+    pub fn with_logging(logging: LoggingState) -> Self {
         Self {
             tool_router: Self::tool_router(),
+            logging,
         }
+    }
+
+    /// Get a reference to the logging state for background task setup.
+    pub fn logging_state(&self) -> &LoggingState {
+        &self.logging
     }
 }
 
@@ -323,6 +425,485 @@ impl ServiceGatorServer {
         Ok(result)
     }
 
+    /// Execute a command in a specific directory and capture output.
+    async fn exec_command_in_dir(
+        &self,
+        command: &str,
+        args: &[String],
+        dir: &camino::Utf8Path,
+    ) -> Result<String, String> {
+        let output = Command::new(command)
+            .args(args)
+            .current_dir(dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| format!("Failed to spawn {}: {}", command, e))?;
+
+        let mut result = String::from_utf8_lossy(&output.stdout).to_string();
+
+        if !output.stderr.is_empty() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(&stderr);
+        }
+
+        if !output.status.success() {
+            return Err(format!(
+                "{}\n[exit code: {}]",
+                result,
+                output.status.code().unwrap_or(-1)
+            ));
+        }
+
+        Ok(result)
+    }
+
+    /// Inner implementation for git_push_local that returns Result for cleaner error handling.
+    async fn git_push_local_inner(
+        &self,
+        config: &ScopeConfig,
+        input: &GitPushLocalInput,
+    ) -> Result<String, String> {
+        tracing::info!(
+            operation = "git_push_local",
+            target = %input.target,
+            commit = %input.commit_sha,
+            branch_desc = %input.description,
+            "starting git push operation"
+        );
+
+        // Parse the target scope (e.g., "github:owner/repo", "gitlab:group/project")
+        let (forge, repo_path) = input.target.split_once(':').ok_or_else(|| {
+            let err = format!(
+                "Invalid target format '{}'. Expected 'forge:path' (e.g., 'github:owner/repo')",
+                input.target
+            );
+            tracing::error!(operation = "git_push_local", error = %err);
+            err
+        })?;
+
+        // Validate and get credentials based on forge type
+        let (remote_url, display_target) = match forge {
+            "github" => {
+                // For GitHub, use the dedicated github_push tool instead
+                return Err("Use the 'github_push' tool for GitHub repositories. \
+                     git_push_local is for GitLab and Forgejo only."
+                    .to_string());
+            }
+            "gitlab" => {
+                // Permission check - GitLab requires create-draft permission
+                if !config
+                    .gitlab
+                    .is_allowed(repo_path, crate::scope::GlOpType::CreateDraft, None)
+                {
+                    return Err(format!(
+                        "create-draft permission not granted for gitlab:{}",
+                        repo_path
+                    ));
+                }
+                let token = crate::core::get_token_trimmed("GITLAB_TOKEN", None)
+                    .ok_or("No GitLab token available (GITLAB_TOKEN not set)")?;
+                // Use configured host or default to gitlab.com
+                let host = config.gitlab.host.as_deref().unwrap_or("gitlab.com");
+                let url = format!("https://oauth2:{}@{}/{}.git", token, host, repo_path);
+                (url, format!("gitlab:{}", repo_path))
+            }
+            "forgejo" => {
+                // Find the matching Forgejo scope with create-draft permission
+                let scope = config
+                    .forgejo
+                    .iter()
+                    .find(|s| {
+                        s.is_allowed(repo_path, crate::scope::ForgejoOpType::CreateDraft, None)
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "create-draft permission not granted for forgejo:{}",
+                            repo_path
+                        )
+                    })?;
+                let token = scope
+                    .token
+                    .as_ref()
+                    .map(|t| t.expose_secret().to_string())
+                    .or_else(|| std::env::var("FORGEJO_TOKEN").ok())
+                    .filter(|t| !t.is_empty())
+                    .ok_or("No Forgejo token available")?;
+                let url = format!(
+                    "https://{}:{}@{}/{}.git",
+                    "token", token, scope.host, repo_path
+                );
+                (url, format!("forgejo:{}", repo_path))
+            }
+            _ => {
+                return Err(format!(
+                    "Unknown forge '{}'. Supported: gitlab, forgejo (use github_push for GitHub)",
+                    forge
+                ));
+            }
+        };
+
+        // repo_path is already validated to be under /workspaces by the WorkspacePath type
+        let agent_repo_path = input.repo_path.as_path();
+
+        // Verify the path exists and is a git repository
+        let git_dir = agent_repo_path.join(".git");
+        if !git_dir.exists() {
+            return Err(format!(
+                "Not a git repository (no .git directory): {}",
+                agent_repo_path
+            ));
+        }
+
+        // Build the branch name with agent- prefix
+        let branch = format!("agent-{}", input.description);
+
+        // Create a temporary directory for the trusted clone
+        let temp_dir = tempfile::TempDir::new()
+            .map_err(|e| format!("Failed to create temp directory: {e}"))?;
+        let trusted_clone_path = temp_dir.path();
+        let trusted_clone_path_utf8 = camino::Utf8Path::from_path(trusted_clone_path)
+            .ok_or("Temporary directory path is not valid UTF-8")?;
+
+        // Clone from the remote using the agent's repo as a reference for object borrowing.
+        // This is safe because --reference only reads object data, not hooks/config.
+        // We use --dissociate to copy objects and remove the alternates link after clone.
+        // We use --no-checkout since we only need to push, not checkout files.
+        // We use --filter=blob:none for a blobless clone (we'll fetch specific objects).
+        let clone_args = vec![
+            "clone".to_string(),
+            "--reference".to_string(),
+            agent_repo_path.to_string(),
+            "--dissociate".to_string(),
+            "--no-checkout".to_string(),
+            "--filter=blob:none".to_string(),
+            remote_url.clone(),
+            ".".to_string(),
+        ];
+
+        self.exec_command_in_dir("git", &clone_args, trusted_clone_path_utf8)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    operation = "git_push_local",
+                    step = "clone",
+                    target = %display_target,
+                    error = %e,
+                    "failed to create trusted clone"
+                );
+                format!("Failed to create trusted clone: {e}")
+            })?;
+
+        // Fetch the specific commit from the agent's repo into our trusted clone.
+        // This is safe because fetching only transfers git objects (blobs, trees, commits),
+        // not hooks or config.
+        // Note: safe.directory is configured globally at startup to allow reading from
+        // workspace repos that may be owned by a different uid.
+        let fetch_args = vec![
+            "fetch".to_string(),
+            agent_repo_path.to_string(),
+            input.commit_sha.to_string(),
+        ];
+
+        self.exec_command_in_dir("git", &fetch_args, trusted_clone_path_utf8)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    operation = "git_push_local",
+                    step = "fetch",
+                    target = %display_target,
+                    commit = %input.commit_sha,
+                    error = %e,
+                    "failed to fetch commit from agent repo"
+                );
+                format!(
+                    "Failed to fetch commit {} from agent repo: {e}. \
+                     Make sure the commit exists in the local repository.",
+                    input.commit_sha
+                )
+            })?;
+
+        // Push the commit to the remote branch from our trusted clone.
+        // This is safe because we're running git in our own trusted clone directory.
+        let refspec = format!("{}:refs/heads/{}", input.commit_sha, branch);
+        let push_args = vec!["push".to_string(), "origin".to_string(), refspec];
+
+        self.exec_command_in_dir("git", &push_args, trusted_clone_path_utf8)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    operation = "git_push_local",
+                    step = "push",
+                    target = %display_target,
+                    commit = %input.commit_sha,
+                    branch = %branch,
+                    error = %e,
+                    "git push failed"
+                );
+                format!("Git push failed: {e}")
+            })?;
+
+        tracing::info!(
+            operation = "git_push_local",
+            target = %display_target,
+            commit = %input.commit_sha,
+            branch = %branch,
+            "git push completed successfully"
+        );
+
+        Ok(format!(
+            "Successfully pushed commit {} to branch '{}' on {}. \
+             You can now create a draft PR from this branch.",
+            input.commit_sha, branch, display_target
+        ))
+        // temp_dir is automatically cleaned up when dropped
+    }
+
+    /// Inner implementation for GitHub push with optional draft PR creation.
+    ///
+    /// Pushes a commit to GitHub and optionally creates a draft PR.
+    async fn github_push_inner(
+        &self,
+        config: &ScopeConfig,
+        input: &GithubPushInput,
+    ) -> Result<String, String> {
+        let repo_string = input.repo.as_str();
+        let repo = repo_string.as_str();
+
+        // Permission check
+        if !config.gh.is_allowed(repo, GhOpType::CreateDraft, None) {
+            return Err(format!(
+                "create-draft permission not granted for github:{}",
+                repo
+            ));
+        }
+
+        // Validate PR fields if creating a draft PR
+        let (base, title) = if input.create_draft_pr {
+            let base = input
+                .base
+                .as_ref()
+                .ok_or("base is required when create_draft_pr is true (e.g., \"main\")")?;
+            let title = input
+                .title
+                .as_ref()
+                .ok_or("title is required when create_draft_pr is true")?;
+            (Some(base.as_str()), Some(title.as_str()))
+        } else {
+            (None, None)
+        };
+
+        tracing::info!(
+            operation = "github_push",
+            repo = %repo,
+            commit = %input.commit_sha,
+            branch_desc = %input.description,
+            create_draft_pr = %input.create_draft_pr,
+            "starting GitHub push operation"
+        );
+
+        // Get GitHub token
+        let token = crate::core::get_token_trimmed("GH_TOKEN", Some("GITHUB_TOKEN"))
+            .ok_or("No GitHub token available (GH_TOKEN or GITHUB_TOKEN not set)")?;
+
+        let remote_url = format!("https://x-access-token:{}@github.com/{}.git", token, repo);
+
+        // Validate local repository
+        let agent_repo_path = input.repo_path.as_path();
+        let git_dir = agent_repo_path.join(".git");
+        if !git_dir.exists() {
+            return Err(format!(
+                "Not a git repository (no .git directory): {}",
+                agent_repo_path
+            ));
+        }
+
+        // Build the branch name with agent- prefix
+        let branch = format!("agent-{}", input.description);
+
+        // Create a temporary directory for the trusted clone
+        let temp_dir = tempfile::TempDir::new()
+            .map_err(|e| format!("Failed to create temp directory: {e}"))?;
+        let trusted_clone_path = temp_dir.path();
+        let trusted_clone_path_utf8 = camino::Utf8Path::from_path(trusted_clone_path)
+            .ok_or("Temporary directory path is not valid UTF-8")?;
+
+        // Clone from the remote using the agent's repo as a reference
+        let clone_args = vec![
+            "clone".to_string(),
+            "--reference".to_string(),
+            agent_repo_path.to_string(),
+            "--dissociate".to_string(),
+            "--no-checkout".to_string(),
+            "--filter=blob:none".to_string(),
+            remote_url.clone(),
+            ".".to_string(),
+        ];
+
+        self.exec_command_in_dir("git", &clone_args, trusted_clone_path_utf8)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    operation = "github_push",
+                    step = "clone",
+                    repo = %repo,
+                    error = %e,
+                    "failed to create trusted clone"
+                );
+                format!("Failed to create trusted clone: {e}")
+            })?;
+
+        // Fetch the specific commit from the agent's repo.
+        // Note: safe.directory is configured globally at startup to allow reading from
+        // workspace repos that may be owned by a different uid.
+        let fetch_args = vec![
+            "fetch".to_string(),
+            agent_repo_path.to_string(),
+            input.commit_sha.to_string(),
+        ];
+
+        self.exec_command_in_dir("git", &fetch_args, trusted_clone_path_utf8)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    operation = "github_push",
+                    step = "fetch",
+                    repo = %repo,
+                    commit = %input.commit_sha,
+                    error = %e,
+                    "failed to fetch commit from agent repo"
+                );
+                format!(
+                    "Failed to fetch commit {} from agent repo: {e}. \
+                     Make sure the commit exists in the local repository.",
+                    input.commit_sha
+                )
+            })?;
+
+        // Push the commit to the remote branch
+        let refspec = format!("{}:refs/heads/{}", input.commit_sha, branch);
+        let push_args = vec!["push".to_string(), "origin".to_string(), refspec];
+
+        self.exec_command_in_dir("git", &push_args, trusted_clone_path_utf8)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    operation = "github_push",
+                    step = "push",
+                    repo = %repo,
+                    commit = %input.commit_sha,
+                    branch = %branch,
+                    error = %e,
+                    "git push failed"
+                );
+                format!("Git push failed: {e}")
+            })?;
+
+        tracing::info!(
+            operation = "github_push",
+            repo = %repo,
+            commit = %input.commit_sha,
+            branch = %branch,
+            "push completed successfully"
+        );
+
+        // If not creating a draft PR, return now
+        if !input.create_draft_pr {
+            return Ok(format!(
+                "Successfully pushed commit {} to branch '{}' on github:{}",
+                input.commit_sha, branch, repo
+            ));
+        }
+
+        // Create the draft PR
+        tracing::info!(
+            operation = "github_push",
+            repo = %repo,
+            branch = %branch,
+            "creating draft PR"
+        );
+
+        let endpoint = format!("repos/{}/pulls", repo);
+        let payload = serde_json::json!({
+            "title": title.unwrap(),
+            "head": branch,
+            "base": base.unwrap(),
+            "body": input.body.as_deref().unwrap_or(""),
+            "draft": true,
+        });
+
+        let args = vec![
+            "api".to_string(),
+            "--method=POST".to_string(),
+            endpoint,
+            "--input".to_string(),
+            "-".to_string(),
+        ];
+
+        let payload_str = payload.to_string();
+        let pr_output = self
+            .exec_command_with_stdin("gh", &args, &payload_str)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    operation = "github_push",
+                    step = "create_pr",
+                    repo = %repo,
+                    branch = %branch,
+                    error = %e,
+                    "failed to create draft PR"
+                );
+                format!("Push succeeded but failed to create draft PR: {e}")
+            })?;
+
+        // Check if the PR creation response indicates an error
+        let is_error = pr_output.contains("[exit code:")
+            || pr_output.contains("\"message\":")
+            || pr_output.contains("\"errors\":");
+
+        if is_error {
+            tracing::error!(
+                operation = "github_push",
+                step = "create_pr",
+                repo = %repo,
+                branch = %branch,
+                response = %pr_output,
+                "draft PR creation failed"
+            );
+            return Err(format!(
+                "Push succeeded to branch '{}' but draft PR creation failed: {}",
+                branch, pr_output
+            ));
+        }
+
+        tracing::info!(
+            operation = "github_push",
+            repo = %repo,
+            branch = %branch,
+            "draft PR created successfully"
+        );
+
+        // Parse the PR URL from the response for a nicer message
+        let pr_url = serde_json::from_str::<serde_json::Value>(&pr_output)
+            .ok()
+            .and_then(|v| v.get("html_url").and_then(|u| u.as_str()).map(String::from));
+
+        match pr_url {
+            Some(url) => Ok(format!(
+                "Successfully pushed commit {} to branch '{}' and created draft PR: {}",
+                input.commit_sha, branch, url
+            )),
+            None => Ok(format!(
+                "Successfully pushed commit {} to branch '{}' and created draft PR.\n\nResponse:\n{}",
+                input.commit_sha, branch, pr_output
+            )),
+        }
+    }
+
     /// Handle the GitHub API operation.
     async fn github_api_impl(
         &self,
@@ -389,6 +970,15 @@ impl ServiceGatorServer {
                     "Write access not allowed for repository: {repo}{scope_msg}"
                 ))]));
             }
+            // Log write operation
+            tracing::info!(
+                operation = "github_api",
+                method = %method,
+                repo = %repo,
+                endpoint = %endpoint,
+                resource = resource_ref.as_deref().unwrap_or("-"),
+                "github API write operation"
+            );
         } else {
             // For reads, check read permission
             if !config.gh.is_read_allowed(&repo) {
@@ -396,6 +986,8 @@ impl ServiceGatorServer {
                     "Read access not allowed for repository: {repo}"
                 ))]));
             }
+            // Count read operation (logged in aggregate)
+            self.logging.read_ops.increment();
         }
 
         // Build the gh api command args
@@ -436,53 +1028,6 @@ impl ServiceGatorServer {
                 }
                 Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
             }
-        }
-    }
-
-    /// Handle creating a draft pull request.
-    async fn github_create_draft_pr_impl(
-        &self,
-        config: &ScopeConfig,
-        repo: &str,
-        head: &str,
-        base: &str,
-        title: &str,
-        body: Option<&str>,
-    ) -> Result<CallToolResult, McpError> {
-        // Check permission
-        if !config.gh.is_allowed(repo, GhOpType::CreateDraft, None) {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "create-draft permission not granted for repository: {repo}"
-            ))]));
-        }
-
-        // Build the API endpoint
-        let endpoint = format!("repos/{}/pulls", repo);
-
-        // Build the payload - always set draft to true
-        let payload = serde_json::json!({
-            "title": title,
-            "head": head,
-            "base": base,
-            "body": body.unwrap_or(""),
-            "draft": true,
-        });
-
-        let args = vec![
-            "api".to_string(),
-            "--method=POST".to_string(),
-            endpoint,
-            "--input".to_string(),
-            "-".to_string(),
-        ];
-
-        let payload_str = payload.to_string();
-        match self
-            .exec_command_with_stdin("gh", &args, &payload_str)
-            .await
-        {
-            Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
         }
     }
 
@@ -575,6 +1120,8 @@ impl ServiceGatorServer {
         // Execute the operation
         match op {
             PendingReviewOp::List | PendingReviewOp::Get => {
+                // Read operations - count for aggregated logging
+                self.logging.read_ops.increment();
                 let args = vec!["api".to_string(), "--method=GET".to_string(), endpoint];
                 match self.exec_command("gh", &args).await {
                     Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
@@ -583,6 +1130,13 @@ impl ServiceGatorServer {
             }
 
             PendingReviewOp::Create => {
+                tracing::info!(
+                    operation = "github_pending_review",
+                    action = "create",
+                    repo = %repo,
+                    pull_number = pull_number,
+                    "creating pending review"
+                );
                 let body_text = body.unwrap_or("");
                 let body_with_marker = if body_text.contains(REVIEW_MARKER_TOKEN) {
                     body_text.to_string()
@@ -612,11 +1166,30 @@ impl ServiceGatorServer {
                     .await
                 {
                     Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
-                    Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+                    Err(e) => {
+                        tracing::error!(
+                            operation = "github_pending_review",
+                            action = "create",
+                            repo = %repo,
+                            pull_number = pull_number,
+                            error = %e,
+                            "failed to create pending review"
+                        );
+                        Ok(CallToolResult::error(vec![Content::text(e)]))
+                    }
                 }
             }
 
             PendingReviewOp::Update => {
+                tracing::info!(
+                    operation = "github_pending_review",
+                    action = "update",
+                    repo = %repo,
+                    pull_number = pull_number,
+                    review_id = ?review_id,
+                    "updating pending review"
+                );
+
                 let body_text = match body {
                     Some(b) => b,
                     None => {
@@ -650,11 +1223,30 @@ impl ServiceGatorServer {
                     .await
                 {
                     Ok(output) => Ok(CallToolResult::success(vec![Content::text(output)])),
-                    Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+                    Err(e) => {
+                        tracing::error!(
+                            operation = "github_pending_review",
+                            action = "update",
+                            repo = %repo,
+                            pull_number = pull_number,
+                            error = %e,
+                            "failed to update pending review"
+                        );
+                        Ok(CallToolResult::error(vec![Content::text(e)]))
+                    }
                 }
             }
 
             PendingReviewOp::Delete => {
+                tracing::info!(
+                    operation = "github_pending_review",
+                    action = "delete",
+                    repo = %repo,
+                    pull_number = pull_number,
+                    review_id = ?review_id,
+                    "deleting pending review"
+                );
+
                 let args = vec!["api".to_string(), "--method=DELETE".to_string(), endpoint];
 
                 match self.exec_command("gh", &args).await {
@@ -667,7 +1259,17 @@ impl ServiceGatorServer {
                             Ok(CallToolResult::success(vec![Content::text(output)]))
                         }
                     }
-                    Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+                    Err(e) => {
+                        tracing::error!(
+                            operation = "github_pending_review",
+                            action = "delete",
+                            repo = %repo,
+                            pull_number = pull_number,
+                            error = %e,
+                            "failed to delete pending review"
+                        );
+                        Ok(CallToolResult::error(vec![Content::text(e)]))
+                    }
                 }
             }
         }
@@ -702,29 +1304,6 @@ impl ServiceGatorServer {
         .await
     }
 
-    /// Create a draft pull request on GitHub.
-    ///
-    /// Requires create-draft permission for the target repository.
-    #[tool(description = "Create a draft pull request on GitHub. \
-        Requires create-draft permission for the target repository. \
-        Use the 'status' tool to view your current permissions.")]
-    async fn github_create_draft_pr_tool(
-        &self,
-        Extension(parts): Extension<http::request::Parts>,
-        Parameters(input): Parameters<GithubCreateDraftPrInput>,
-    ) -> Result<CallToolResult, McpError> {
-        let config = get_scopes_from_parts(&parts)?;
-        self.github_create_draft_pr_impl(
-            &config,
-            &input.repo,
-            &input.head,
-            &input.base,
-            &input.title,
-            input.body.as_deref(),
-        )
-        .await
-    }
-
     /// Manage pending PR reviews on GitHub.
     ///
     /// Supports operations: list, create, get, update, delete.
@@ -749,6 +1328,306 @@ impl ServiceGatorServer {
             input.comments,
         )
         .await
+    }
+
+    /// Create a new agent branch on GitHub.
+    ///
+    /// This tool allows sandboxed AI agents to create new branches for PRs.
+    /// Branch names are enforced to use the `agent-` prefix for safety.
+    #[tool(
+        description = "Create a new branch for a draft PR. Branch names are enforced to start with 'agent-' prefix (e.g., 'agent-42-fix-typo' or 'agent-add-feature'). The branch must NOT already exist. Requires create-draft permission."
+    )]
+    async fn gh_create_branch(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(input): Parameters<GhCreateBranchInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let config = get_scopes_from_parts(&parts)?;
+        let repo_str = input.repo.to_string();
+
+        // Check permission - requires create-draft or higher
+        if !config.gh.is_allowed(&repo_str, GhOpType::CreateDraft, None) {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "create-draft permission not granted for repository: {}",
+                repo_str
+            ))]));
+        }
+
+        // Input validation is handled by the newtypes (CommitSha, BranchDescription, RepoName)
+        // during deserialization - if we get here, the inputs are valid.
+
+        // Build the enforced branch name: agent-[issue-]description
+        let branch = match input.issue_number {
+            Some(issue) => format!("agent-{}-{}", issue, input.description),
+            None => format!("agent-{}", input.description),
+        };
+
+        // Check if the branch already exists (MUST NOT exist for create-draft)
+        let ref_path = format!("repos/{}/git/refs/heads/{}", repo_str, branch);
+        let check_args = vec![
+            "api".to_string(),
+            "--method=GET".to_string(),
+            ref_path.clone(),
+        ];
+
+        let ref_exists = match self.exec_command("gh", &check_args).await {
+            Ok(output) => {
+                // If we get valid JSON with "ref" field, the ref exists
+                !output.contains("Not Found") && output.contains("\"ref\"")
+            }
+            Err(_) => false,
+        };
+
+        if ref_exists {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Branch '{}' already exists. For create-draft permission, \
+                 you can only create NEW branches. Use a different description \
+                 or issue number.",
+                branch
+            ))]));
+        }
+
+        tracing::info!(
+            operation = "gh_create_branch",
+            repo = %repo_str,
+            branch = %branch,
+            commit = %input.commit_sha,
+            issue_number = ?input.issue_number,
+            "creating new agent branch"
+        );
+
+        // Create new ref: POST /repos/{owner}/{repo}/git/refs
+        let create_path = format!("repos/{}/git/refs", repo_str);
+        let payload = serde_json::json!({
+            "ref": format!("refs/heads/{}", branch),
+            "sha": input.commit_sha.as_str()
+        });
+
+        let args = vec![
+            "api".to_string(),
+            "--method=POST".to_string(),
+            create_path,
+            "--input".to_string(),
+            "-".to_string(),
+        ];
+
+        let payload_str = payload.to_string();
+        match self
+            .exec_command_with_stdin("gh", &args, &payload_str)
+            .await
+        {
+            Ok(output) => {
+                if output.contains("\"ref\"") {
+                    tracing::info!(
+                        operation = "gh_create_branch",
+                        repo = %repo_str,
+                        branch = %branch,
+                        commit = %input.commit_sha,
+                        "branch created successfully"
+                    );
+                    Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Successfully created branch '{}' at commit {}. \
+                         You can now create a draft PR from this branch.",
+                        branch, input.commit_sha
+                    ))]))
+                } else {
+                    Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Failed to create branch: {}",
+                        output
+                    ))]))
+                }
+            }
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+        }
+    }
+
+    /// Update the head of an existing PR's branch.
+    ///
+    /// This tool allows pushing new commits to a PR that the agent has access to.
+    /// The branch name is looked up from the PR - agents cannot specify arbitrary branches.
+    #[tool(
+        description = "Update an existing PR's head branch with a new commit. The branch is looked up from the PR number - you cannot specify arbitrary branch names. Requires write permission on the PR or repository."
+    )]
+    async fn gh_update_pr_head(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(input): Parameters<GhUpdatePrHeadInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let config = get_scopes_from_parts(&parts)?;
+        let repo_str = input.repo.to_string();
+
+        // First, look up the PR to get the branch name
+        let pr_endpoint = format!("repos/{}/pulls/{}", repo_str, input.pull_number);
+        let pr_args = vec!["api".to_string(), "--method=GET".to_string(), pr_endpoint];
+
+        let pr_json = match self.exec_command("gh", &pr_args).await {
+            Ok(output) => output,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Failed to fetch PR #{}: {}",
+                    input.pull_number, e
+                ))]));
+            }
+        };
+
+        // Parse PR JSON to get branch name
+        let pr_data: serde_json::Value = match serde_json::from_str(&pr_json) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Failed to parse PR data: {}",
+                    e
+                ))]));
+            }
+        };
+
+        let branch_name = match pr_data["head"]["ref"].as_str() {
+            Some(name) => name.to_string(),
+            None => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "Could not find branch name in PR data".to_string(),
+                )]));
+            }
+        };
+
+        // Check permission - need write access since we're updating an existing branch
+        // OR the branch must be an agent- branch and we have create-draft
+        let has_write = config.gh.is_allowed(&repo_str, GhOpType::Write, None);
+        let is_agent_branch = branch_name.starts_with("agent-");
+        let has_create_draft = config.gh.is_allowed(&repo_str, GhOpType::CreateDraft, None);
+
+        if !(has_write || (is_agent_branch && has_create_draft)) {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Cannot update PR #{} branch '{}'. Requires either: \
+                 (1) write permission, or (2) create-draft permission for agent-* branches.",
+                input.pull_number, branch_name
+            ))]));
+        }
+
+        tracing::info!(
+            operation = "gh_update_pr_head",
+            repo = %repo_str,
+            pull_number = %input.pull_number,
+            branch = %branch_name,
+            commit = %input.commit_sha,
+            "updating PR head branch"
+        );
+
+        // Update the branch ref
+        let ref_path = format!("repos/{}/git/refs/heads/{}", repo_str, branch_name);
+        let payload = serde_json::json!({
+            "sha": input.commit_sha.as_str(),
+            "force": true
+        });
+
+        let args = vec![
+            "api".to_string(),
+            "--method=PATCH".to_string(),
+            ref_path,
+            "--input".to_string(),
+            "-".to_string(),
+        ];
+
+        let payload_str = payload.to_string();
+        match self
+            .exec_command_with_stdin("gh", &args, &payload_str)
+            .await
+        {
+            Ok(output) => {
+                if output.contains("\"ref\"") {
+                    tracing::info!(
+                        operation = "gh_update_pr_head",
+                        repo = %repo_str,
+                        pull_number = %input.pull_number,
+                        branch = %branch_name,
+                        commit = %input.commit_sha,
+                        "PR head updated successfully"
+                    );
+                    Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Successfully updated PR #{} branch '{}' to commit {}.",
+                        input.pull_number, branch_name, input.commit_sha
+                    ))]))
+                } else {
+                    tracing::error!(
+                        operation = "gh_update_pr_head",
+                        repo = %repo_str,
+                        pull_number = %input.pull_number,
+                        error = %output,
+                        "failed to update PR head"
+                    );
+                    Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Failed to update branch: {}",
+                        output
+                    ))]))
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    operation = "gh_update_pr_head",
+                    repo = %repo_str,
+                    pull_number = %input.pull_number,
+                    error = %e,
+                    "failed to update PR head"
+                );
+                Ok(CallToolResult::error(vec![Content::text(e)]))
+            }
+        }
+    }
+
+    /// Push a local commit to a remote git repository.
+    ///
+    /// This tool safely pushes commits from an agent's local repository to GitLab
+    /// or Forgejo. For GitHub, use the `github_push` tool instead.
+    ///
+    /// It creates a temporary trusted clone (using the agent's repo only as a
+    /// reference for object borrowing via `--reference`) and pushes from there.
+    /// This ensures no hooks, config, or other code execution vectors from the
+    /// agent's repository are ever executed.
+    ///
+    /// Branch names are automatically prefixed with `agent-` to enforce the agent
+    /// branch naming convention.
+    #[tool(
+        description = "Push a local git commit to GitLab or Forgejo (for GitHub use github_push). \
+                       The branch will be named 'agent-<description>'. Uses a safe push mechanism \
+                       that doesn't execute any code from the local repository. \
+                       NOTE: Requires service-gator to have filesystem access to the local git repo."
+    )]
+    async fn git_push_local(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(input): Parameters<GitPushLocalInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let config = get_scopes_from_parts(&parts)?;
+
+        match self.git_push_local_inner(&config, &input).await {
+            Ok(msg) => Ok(CallToolResult::success(vec![Content::text(msg)])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+        }
+    }
+
+    /// Push a local commit to GitHub, optionally creating a draft PR.
+    ///
+    /// This is the recommended way for agents to submit work for review on GitHub.
+    /// By default, it pushes and creates a draft PR. Set `create_draft_pr: false`
+    /// to only push the branch without creating a PR.
+    #[tool(
+        description = "Push a local git commit to GitHub and optionally create a draft PR. \
+                       By default creates a draft PR (set create_draft_pr=false to skip). \
+                       The branch will be named 'agent-<description>'. Uses a safe push \
+                       mechanism that doesn't execute any code from the local repository. \
+                       NOTE: Requires service-gator to have filesystem access to the local git repo."
+    )]
+    async fn github_push(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(input): Parameters<GithubPushInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let config = get_scopes_from_parts(&parts)?;
+
+        match self.github_push_inner(&config, &input).await {
+            Ok(msg) => Ok(CallToolResult::success(vec![Content::text(msg)])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+        }
     }
 
     /// Execute a GitLab API command within configured scopes.
@@ -801,6 +1680,9 @@ impl ServiceGatorServer {
 
         // Build final args with forced GET method and optional hostname
         let final_args = gitlab::build_api_args_with_host(&api.args, config.gitlab.host.as_deref());
+
+        // Count read operation for aggregated logging
+        self.logging.read_ops.increment();
 
         // Execute
         match self.exec_command("glab", &final_args).await {
@@ -883,8 +1765,11 @@ impl ServiceGatorServer {
         let host = forgejo_scope.host.clone();
         let token = forgejo_scope.token.clone();
 
+        // Count read operation for aggregated logging
+        self.logging.read_ops.increment();
+
         // Create native Forgejo API client
-        let client = match ForgejoClient::new(&host, token.as_deref()) {
+        let client = match ForgejoClient::new(&host, token.as_ref().map(|t| t.expose_secret())) {
             Ok(c) => c,
             Err(e) => {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
@@ -985,7 +1870,7 @@ impl ServiceGatorServer {
             }
         } else {
             // For other commands, check specific project permission
-            let project_key = match &project {
+            let project_key_str = match &project {
                 Some(p) => p,
                 None => {
                     return Ok(CallToolResult::error(vec![Content::text(
@@ -994,18 +1879,36 @@ impl ServiceGatorServer {
                 }
             };
 
-            let project_perms = config.jira.projects.get(project_key);
+            // Parse project key to look up permissions
+            let project_key = match project_key_str.parse::<crate::jira_types::JiraProjectKey>() {
+                Ok(k) => k,
+                Err(e) => {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Invalid project key '{}': {}",
+                        project_key_str, e
+                    ))]));
+                }
+            };
+
+            let project_perms = config.jira.projects.get(&project_key);
             let allowed = match op_type {
                 OpType::Read => project_perms.map(|p| p.can_read()).unwrap_or(false),
                 OpType::Write => {
-                    if let Some(issue) = &validated.issue {
-                        if let Some(issue_perm) = config.jira.issues.get(issue) {
-                            if issue_perm.write {
-                                true
+                    if let Some(issue_str) = &validated.issue {
+                        // Try to parse the issue key for permission lookup
+                        let issue_key_result = issue_str.parse::<crate::jira_types::JiraIssueKey>();
+                        if let Ok(issue_key) = issue_key_result {
+                            if let Some(issue_perm) = config.jira.issues.get(&issue_key) {
+                                if issue_perm.write {
+                                    true
+                                } else {
+                                    project_perms.map(|p| p.can_write()).unwrap_or(false)
+                                }
                             } else {
                                 project_perms.map(|p| p.can_write()).unwrap_or(false)
                             }
                         } else {
+                            // Invalid issue key format, fall back to project permission
                             project_perms.map(|p| p.can_write()).unwrap_or(false)
                         }
                     } else {
@@ -1025,8 +1928,8 @@ impl ServiceGatorServer {
         // Create the JIRA client
         // Use bearer auth if no username, otherwise basic auth
         let client = match &username {
-            Some(user) => JiraClient::new(&host, user, &token),
-            None => JiraClient::with_bearer_token(&host, &token),
+            Some(user) => JiraClient::new(&host, user, token.expose_secret()),
+            None => JiraClient::with_bearer_token(&host, token.expose_secret()),
         };
         let client = match client {
             Ok(c) => c,
@@ -1081,25 +1984,47 @@ async fn execute_jira_command(
     match &validated.command.command {
         JiraSubcommand::Issue(issue_cmd) => match &issue_cmd.action {
             IssueAction::List(args) => {
-                let results = client.list_issues(&args.project).await?;
+                let results = client.list_issues(args.project.as_str()).await?;
                 Ok(serde_json::to_string_pretty(&results)?)
             }
             IssueAction::Show(args) => {
                 let issue_key = args
                     .effective_issue()
                     .ok_or_else(|| eyre::eyre!("Issue key required"))?;
-                let issue = client.get_issue(issue_key).await?;
+                let issue = client.get_issue(&issue_key.to_string()).await?;
                 Ok(serde_json::to_string_pretty(&issue)?)
             }
             IssueAction::Create(args) => {
+                tracing::info!(
+                    operation = "jira_create_issue",
+                    project = %args.project,
+                    summary = %args.summary,
+                    issue_type = args.issue_type.as_deref().unwrap_or("default"),
+                    "creating JIRA issue"
+                );
                 let created = client
                     .create_issue(
-                        &args.project,
+                        args.project.as_str(),
                         &args.summary,
                         args.description.as_deref(),
                         args.issue_type.as_deref(),
                     )
-                    .await?;
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(
+                            operation = "jira_create_issue",
+                            project = %args.project,
+                            error = %e,
+                            "failed to create JIRA issue"
+                        );
+                        e
+                    })?;
+                tracing::info!(
+                    operation = "jira_create_issue",
+                    project = %args.project,
+                    issue_key = %created.key,
+                    "JIRA issue created successfully"
+                );
                 Ok(serde_json::json!({
                     "id": created.id,
                     "key": created.key,
@@ -1114,15 +2039,33 @@ async fn execute_jira_command(
 
                 match &args.transition {
                     Some(transition_name) => {
-                        client.transition_issue(issue_key, transition_name).await?;
+                        tracing::info!(
+                            operation = "jira_transition_issue",
+                            issue = %issue_key,
+                            transition = %transition_name,
+                            "transitioning JIRA issue"
+                        );
+                        client
+                            .transition_issue(&issue_key.to_string(), transition_name)
+                            .await
+                            .map_err(|e| {
+                                tracing::error!(
+                                    operation = "jira_transition_issue",
+                                    issue = %issue_key,
+                                    transition = %transition_name,
+                                    error = %e,
+                                    "failed to transition JIRA issue"
+                                );
+                                e
+                            })?;
                         Ok(format!(
                             "Successfully transitioned {} to {}",
                             issue_key, transition_name
                         ))
                     }
                     None => {
-                        // List available transitions
-                        let transitions = client.get_transitions(issue_key).await?;
+                        // List available transitions (read operation)
+                        let transitions = client.get_transitions(&issue_key.to_string()).await?;
                         Ok(serde_json::to_string_pretty(&transitions)?)
                     }
                 }
@@ -1131,9 +2074,24 @@ async fn execute_jira_command(
                 let issue_key = args
                     .effective_issue()
                     .ok_or_else(|| eyre::eyre!("Issue key required"))?;
+                tracing::info!(
+                    operation = "jira_assign_issue",
+                    issue = %issue_key,
+                    assignee = args.assignee.as_deref().unwrap_or("(unassign)"),
+                    "assigning JIRA issue"
+                );
                 client
-                    .assign_issue(issue_key, args.assignee.as_deref())
-                    .await?;
+                    .assign_issue(&issue_key.to_string(), args.assignee.as_deref())
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(
+                            operation = "jira_assign_issue",
+                            issue = %issue_key,
+                            error = %e,
+                            "failed to assign JIRA issue"
+                        );
+                        e
+                    })?;
                 match &args.assignee {
                     Some(user) => Ok(format!("Successfully assigned {} to {}", issue_key, user)),
                     None => Ok(format!("Successfully unassigned {}", issue_key)),
@@ -1148,7 +2106,7 @@ async fn execute_jira_command(
         },
         JiraSubcommand::Version(version_cmd) => match &version_cmd.action {
             VersionAction::List(args) => {
-                let versions = client.list_versions(&args.project).await?;
+                let versions = client.list_versions(args.project.as_str()).await?;
                 Ok(serde_json::to_string_pretty(&versions)?)
             }
         },
@@ -1164,6 +2122,13 @@ async fn execute_jira_command(
 impl ServerHandler for ServiceGatorServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
+            server_info: Implementation {
+                name: "service-gator".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                title: Some("Scoped CLI access for AI agents".into()),
+                icons: None,
+                website_url: Some("https://github.com/cgwalters/service-gator".into()),
+            },
             instructions: Some(
                 "service-gator: Scoped CLI access for AI agents with comprehensive capability introspection. \
                  \
@@ -1177,11 +2142,18 @@ impl ServerHandler for ServiceGatorServer {
                  Available tools: \
                  - status: Overall service availability and authentication status \
                  - github_api_tool: GitHub REST API access (read/write depending on permissions) \
-                 - github_create_draft_pr_tool: Create draft pull requests on GitHub \
+                 - github_push: Push commits to GitHub and optionally create draft PR (recommended for GitHub) \
                  - github_pending_review_tool: Manage pending PR reviews on GitHub \
                  - gl: GitLab API access (scope-restricted: read/draft-mr/approve/write permissions) \
                  - forgejo: Forgejo/Gitea API access (scope-restricted: read/draft-pr/pending-review/write permissions) \
+                 - gh_create_branch: Create new agent branches (requires create-draft permission, enforces agent- prefix) \
+                 - gh_update_pr_head: Update existing PR branch with new commits (looks up branch from PR) \
+                 - git_push_local: Push commits to GitLab/Forgejo (for GitHub use github_push) \
                  - jira: JIRA operations (scope-restricted: read/create/write permissions) \
+                 \
+                 Git workflow for sandboxed agents: For GitHub, use github_push which pushes your commit and \
+                 optionally creates a draft PR. For GitLab/Forgejo, use git_push_local. \
+                 Do NOT try to use the forge APIs directly for pushing - use these MCP tools instead. \
                  \
                  Security: All operations are scope-restricted. Each tool operates within its configured permissions. \
                  Write operations (draft PR/MR creation, pending review management, approvals) require explicit scope permissions."
@@ -1196,7 +2168,7 @@ impl ServerHandler for ServiceGatorServer {
 /// Generate an overall status report showing all services and their authentication status.
 fn generate_overall_status(config: &ScopeConfig) -> CallToolResult {
     let mut status_lines = vec![
-        "Service-Gator Overall Status".to_string(),
+        format!("Service-Gator v{}", env!("CARGO_PKG_VERSION")),
         "============================".to_string(),
         "".to_string(),
     ];
@@ -1519,21 +2491,35 @@ pub async fn start_server_with_config(bind_addr: &str, config: ServerConfig) -> 
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     };
+    use std::time::Duration;
 
     let ct = tokio_util::sync::CancellationToken::new();
 
     // Create token authority if secret is configured
     let token_authority = config.effective_secret().map(|secret| {
         tracing::info!(mode = ?config.server.mode, "Token authentication enabled");
-        Arc::new(TokenAuthority::new(&secret))
+        Arc::new(TokenAuthority::new(secret.expose_secret()))
     });
 
     if token_authority.is_none() && config.server.mode != AuthMode::None {
         tracing::warn!(mode = ?config.server.mode, "Auth mode set but no secret configured");
     }
 
+    // Create shared logging state for all server instances
+    let logging_state = LoggingState::new();
+
+    // Start background logging task (logs aggregated read operations every 5 seconds)
+    let _logging_handle = logging_state
+        .clone()
+        .spawn_background_logger(Duration::from_secs(5));
+
+    let logging_for_factory = logging_state.clone();
     let mcp_service = StreamableHttpService::new(
-        || Ok(ServiceGatorServer::new()),
+        move || {
+            Ok(ServiceGatorServer::with_logging(
+                logging_for_factory.clone(),
+            ))
+        },
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig {
             cancellation_token: ct.child_token(),
@@ -1571,7 +2557,10 @@ pub async fn start_server_with_config(bind_addr: &str, config: ServerConfig) -> 
     axum::serve(tcp_listener, router)
         .with_graceful_shutdown(async move {
             tokio::signal::ctrl_c().await.ok();
+            tracing::info!("Shutting down MCP server");
             ct.cancel();
+            // Signal the logging task to flush and stop
+            logging_state.shutdown();
         })
         .await?;
 
@@ -1614,7 +2603,10 @@ async fn mint_token_handler(
         .unwrap_or("");
 
     // Use constant-time comparison to prevent timing attacks
-    if !constant_time_eq(provided_key.as_bytes(), expected_admin_key.as_bytes()) {
+    if !constant_time_eq(
+        provided_key.as_bytes(),
+        expected_admin_key.expose_secret().as_bytes(),
+    ) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(AuthError::new("invalid admin key")),
@@ -1639,8 +2631,8 @@ async fn mint_token_handler(
             ))),
         )
             .into_response(),
-        Err(MintError::Signing(_)) => {
-            tracing::error!("Token signing failed");
+        Err(MintError::Signing(e)) => {
+            tracing::error!(error = %e, "Token signing failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(AuthError::new("token creation failed")),

@@ -31,6 +31,7 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use serde::{Deserialize, Serialize};
 
 use crate::scope::ScopeConfig;
+use crate::secret::SecretString;
 
 /// JWT claims for service-gator tokens.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,12 +83,12 @@ pub struct ServerAuthConfig {
     /// Secret key for JWT signing (HMAC-SHA256).
     /// Can also be set via SERVER_SECRET environment variable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub secret: Option<String>,
+    pub secret: Option<SecretString>,
 
     /// Admin key for /admin/* endpoints.
     /// Can also be set via ADMIN_KEY environment variable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub admin_key: Option<String>,
+    pub admin_key: Option<SecretString>,
 
     /// Authentication mode.
     #[serde(default)]
@@ -356,11 +357,11 @@ impl ServerConfig {
     /// 1. Config file `server.secret`
     /// 2. `SERVICE_GATOR_SECRET` environment variable
     /// 3. File path from `SERVICE_GATOR_SECRET_FILE` environment variable
-    pub fn effective_secret(&self) -> Option<String> {
+    pub fn effective_secret(&self) -> Option<SecretString> {
         self.server
             .secret
             .clone()
-            .or_else(|| env_or_file("SERVICE_GATOR_SECRET"))
+            .or_else(|| env_or_file("SERVICE_GATOR_SECRET").map(SecretString::new))
     }
 
     /// Get the effective admin key, checking environment variable and file as fallback.
@@ -369,11 +370,11 @@ impl ServerConfig {
     /// 1. Config file `server.admin-key`
     /// 2. `SERVICE_GATOR_ADMIN_KEY` environment variable
     /// 3. File path from `SERVICE_GATOR_ADMIN_KEY_FILE` environment variable
-    pub fn effective_admin_key(&self) -> Option<String> {
+    pub fn effective_admin_key(&self) -> Option<SecretString> {
         self.server
             .admin_key
             .clone()
-            .or_else(|| env_or_file("SERVICE_GATOR_ADMIN_KEY"))
+            .or_else(|| env_or_file("SERVICE_GATOR_ADMIN_KEY").map(SecretString::new))
     }
 }
 
@@ -838,8 +839,14 @@ mod tests {
 
         let config: ServerConfig = toml::from_str(toml).expect("parsing should succeed");
 
-        assert_eq!(config.server.secret, Some("my-secret".into()));
-        assert_eq!(config.server.admin_key, Some("my-admin-key".into()));
+        assert_eq!(
+            config.server.secret,
+            Some(SecretString::new("my-secret".to_string()))
+        );
+        assert_eq!(
+            config.server.admin_key,
+            Some(SecretString::new("my-admin-key".to_string()))
+        );
         assert_eq!(config.server.mode, AuthMode::Required);
         assert!(config.server.rotation.enabled);
         assert_eq!(config.server.rotation.max_lifetime, Some(86400));

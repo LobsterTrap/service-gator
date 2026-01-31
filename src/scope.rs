@@ -8,6 +8,9 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::jira_types::{JiraIssueKey, JiraProjectKey};
+use crate::secret::ApiToken;
+
 // ============================================================================
 // Helper functions for serde defaults
 // ============================================================================
@@ -54,6 +57,7 @@ pub struct GhRepoPermission {
     #[serde(default = "default_true")]
     pub read: bool,
     /// Can create draft PRs in this repo.
+    /// Also allows creating agent- prefixed branches for sandboxed AI agents.
     /// Defaults to true - drafts require human review before merge.
     #[serde(default = "default_true")]
     pub create_draft: bool,
@@ -127,6 +131,7 @@ impl GhRepoPermission {
     }
 
     /// Check if creating draft PRs is allowed.
+    /// Also controls creation of agent- prefixed branches.
     pub fn can_create_draft(&self) -> bool {
         self.create_draft || self.write
     }
@@ -195,7 +200,7 @@ impl Default for GhResourcePermission {
 pub enum GhOpType {
     /// Read operation (list, view, diff, etc.)
     Read,
-    /// Create a draft PR
+    /// Create a draft PR (also allows creating agent- branches)
     CreateDraft,
     /// Manage pending PR reviews (create, update body, delete)
     ManagePendingReview,
@@ -781,7 +786,7 @@ pub struct ForgejoScope {
     /// API token for authentication (optional for public repos).
     /// Can also be set via environment variable FORGEJO_TOKEN or GITEA_TOKEN.
     #[serde(default)]
-    pub token: Option<String>,
+    pub token: Option<ApiToken>,
 
     /// Repository permissions: "owner/repo" or "owner/*" → permission
     #[serde(default)]
@@ -939,15 +944,15 @@ pub struct JiraScope {
     /// For JIRA Cloud, generate at: https://id.atlassian.com/manage-profile/security/api-tokens
     /// Can also be set via JIRA_API_TOKEN environment variable.
     #[serde(default)]
-    pub token: Option<String>,
+    pub token: Option<ApiToken>,
 
     /// Project permissions: "PROJ" → permission
     #[serde(default)]
-    pub projects: HashMap<String, JiraProjectPermission>,
+    pub projects: HashMap<JiraProjectKey, JiraProjectPermission>,
 
     /// Issue-specific permissions: "PROJ-123" → permission
     #[serde(default)]
-    pub issues: HashMap<String, JiraIssuePermission>,
+    pub issues: HashMap<JiraIssueKey, JiraIssuePermission>,
 }
 
 // ============================================================================
@@ -1106,7 +1111,8 @@ mod tests {
 
         assert!(config.gh.repos.get("owner/repo").unwrap().create_draft);
         assert!(config.gh.prs.get("owner/repo#42").unwrap().write);
-        assert!(config.jira.projects.get("MYPROJ").unwrap().create);
+        let myproj_key: JiraProjectKey = "MYPROJ".parse().unwrap();
+        assert!(config.jira.projects.get(&myproj_key).unwrap().create);
     }
 
     #[test]
@@ -1276,6 +1282,10 @@ mod tests {
         assert!(perm.can_manage_pending_review());
         assert!(!perm.can_write());
     }
+
+    // ========================================================================
+    // Tests for push-branch permission
+    // ========================================================================
 
     // ========================================================================
     // GitLab scope tests
