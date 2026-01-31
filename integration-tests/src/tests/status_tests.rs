@@ -201,8 +201,8 @@ repos = { "team/project" = { read = true, write = true } }
 
     // Verify the status contains service information
     assert!(
-        status_text.contains("Service-Gator Overall Status"),
-        "Status should have header"
+        status_text.contains("Service-Gator v"),
+        "Status should have version header"
     );
 
     println!("Overall Status Output:\n{}", status_text);
@@ -245,20 +245,23 @@ repos = { "test/repo" = { read = true } }
         "Status tool should be available in tools list"
     );
 
-    // Verify service tools are available
-    let expected_service_tools = vec![
+    // Verify core tools are available (these are always present regardless of config)
+    let expected_core_tools = vec![
         "github_api_tool",
-        "github_create_draft_pr_tool",
         "github_pending_review_tool",
+        "gh_create_branch",
+        "gh_update_pr_head",
+        "github_push",
+        "git_push_local",
         "gl",
         "forgejo",
         "jira",
     ];
-    for service in expected_service_tools {
+    for tool in expected_core_tools {
         assert!(
-            tool_names.contains(&service),
-            "Service tool '{}' should be available",
-            service
+            tool_names.contains(&tool),
+            "Tool '{}' should be available",
+            tool
         );
     }
 

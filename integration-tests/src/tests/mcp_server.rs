@@ -292,30 +292,28 @@ impl McpSession {
         self.send_request(request)
     }
 
-    /// Call the github_create_draft_pr_tool
-    fn call_github_create_draft_pr(
+    /// Call the gh_create_branch tool
+    fn call_gh_create_branch(
         &mut self,
         repo: &str,
-        head: &str,
-        base: &str,
-        title: &str,
-        body: Option<&str>,
+        commit_sha: &str,
+        description: &str,
+        issue_number: Option<u64>,
     ) -> Result<Value> {
         let id = self.next_id();
         let mut arguments = json!({
             "repo": repo,
-            "head": head,
-            "base": base,
-            "title": title
+            "commit_sha": commit_sha,
+            "description": description
         });
-        if let Some(body_text) = body {
-            arguments["body"] = json!(body_text);
+        if let Some(issue) = issue_number {
+            arguments["issue_number"] = json!(issue);
         }
         let request = json!({
             "jsonrpc": "2.0",
             "method": "tools/call",
             "params": {
-                "name": "github_create_draft_pr_tool",
+                "name": "gh_create_branch",
                 "arguments": arguments
             },
             "id": id
@@ -927,8 +925,8 @@ fn test_mcp_github_api_write_denied_without_permission() -> Result<()> {
 }
 integration_test!(test_mcp_github_api_write_denied_without_permission);
 
-/// Test that create-draft-pr is denied without create-draft permission
-fn test_mcp_github_create_draft_pr_denied() -> Result<()> {
+/// Test that gh_create_branch is denied without create-draft permission
+fn test_mcp_github_create_branch_denied() -> Result<()> {
     let test_repo = get_test_repo();
 
     // Read-only permission (explicitly disable create-draft)
@@ -945,8 +943,13 @@ fn test_mcp_github_create_draft_pr_denied() -> Result<()> {
     let _ = session.initialize()?;
     session.send_initialized()?;
 
-    let response =
-        session.call_github_create_draft_pr(&test_repo, "test-branch", "main", "Test PR", None)?;
+    // Use a fake but valid-looking commit SHA for testing permission denial
+    let response = session.call_gh_create_branch(
+        &test_repo,
+        "abc1234567890def1234567890abcdef12345678",
+        "test-feature",
+        None,
+    )?;
 
     let result = &response["result"];
     let is_error = result
@@ -955,7 +958,7 @@ fn test_mcp_github_create_draft_pr_denied() -> Result<()> {
         .unwrap_or(false);
     assert!(
         is_error,
-        "Expected create-draft-pr to be denied without permission, got: {}",
+        "Expected create-branch to be denied without permission, got: {}",
         result
     );
 
@@ -968,7 +971,7 @@ fn test_mcp_github_create_draft_pr_denied() -> Result<()> {
 
     Ok(())
 }
-integration_test!(test_mcp_github_create_draft_pr_denied);
+integration_test!(test_mcp_github_create_branch_denied);
 
 /// Test that pending-review is denied without pending-review permission
 fn test_mcp_github_pending_review_denied() -> Result<()> {
