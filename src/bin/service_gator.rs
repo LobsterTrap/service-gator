@@ -535,16 +535,28 @@ fn run_gh(config: &ScopeConfig, args: Vec<String>) -> Result<ExitCode> {
         // GraphQL permission check (global, not per-repo)
         // Note: Mutations are already rejected in parse_api()
         if !config.gh.graphql_read_allowed() {
-            bail!("GraphQL read access not allowed; set `graphql = \"read\"` or `graphql = true` in [gh] section of config");
+            bail!("GraphQL read access not allowed; set `read = true` or `graphql = \"read\"` in [gh] section of config");
         }
     } else {
-        // REST API - check per-repo permission
-        let repo = api.repo.as_ref().ok_or_else(|| {
-            eyre::eyre!("could not determine repository; use /repos/owner/repo/...")
-        })?;
-
-        if !config.gh.is_read_allowed(repo) {
-            bail!("read access not allowed for '{repo}'; check ~/.config/service-gator.toml");
+        // REST API - check permission
+        match &api.repo {
+            Some(repo) => {
+                // Have a repo - check per-repo or global permission
+                if !config.gh.is_read_allowed(repo) {
+                    bail!(
+                        "read access not allowed for '{repo}'; check ~/.config/service-gator.toml"
+                    );
+                }
+            }
+            None => {
+                // No repo in path (e.g., /search, /gists, /user) - require global read
+                if !config.gh.global_read_allowed() {
+                    bail!(
+                        "could not determine repository from path; \
+                         use /repos/owner/repo/... or set `read = true` in [gh] section for global access"
+                    );
+                }
+            }
         }
     }
 

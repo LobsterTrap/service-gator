@@ -371,6 +371,13 @@ impl<'de> Deserialize<'de> for GraphQlPermission {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct GithubScope {
+    /// Global read access for all GitHub API endpoints.
+    /// When true, allows read-only access to any endpoint including non-repo
+    /// paths like /search, /gists, /user, /orgs, etc.
+    /// This also implicitly enables GraphQL read access.
+    #[serde(default)]
+    pub read: bool,
+
     /// Repository permissions: "owner/repo" or "owner/*" → permission
     #[serde(default)]
     pub repos: HashMap<String, GhRepoPermission>,
@@ -386,6 +393,7 @@ pub struct GithubScope {
 
     /// GraphQL API permission level.
     /// GraphQL queries can span multiple repos, so this is a global setting.
+    /// Note: If `read = true` is set, GraphQL read access is implicitly enabled.
     #[serde(default)]
     pub graphql: GraphQlPermission,
 }
@@ -410,7 +418,13 @@ impl GithubScope {
     }
 
     /// Check if read access is allowed for a specific repository.
+    /// Returns true if global `read = true` is set, or if the repo matches
+    /// a pattern with read permission.
     pub fn is_read_allowed(&self, repo: &str) -> bool {
+        // Global read permission bypasses per-repo checks
+        if self.read {
+            return true;
+        }
         let repo_patterns = self.repo_patterns();
         repo_patterns
             .get(repo)
@@ -418,13 +432,24 @@ impl GithubScope {
             .unwrap_or(false)
     }
 
+    /// Check if global read access is enabled (for non-repo endpoints like /search, /gists).
+    pub fn global_read_allowed(&self) -> bool {
+        self.read
+    }
+
     /// Check if GraphQL read access is allowed.
+    /// Returns true if global `read = true` is set, or if `graphql` is set to read.
     pub fn graphql_read_allowed(&self) -> bool {
-        self.graphql.can_read()
+        self.read || self.graphql.can_read()
     }
 
     /// Check if an operation is allowed.
     pub fn is_allowed(&self, repo: &str, op: GhOpType, resource_ref: Option<&str>) -> bool {
+        // Global read permission bypasses per-repo checks for read operations
+        if op == GhOpType::Read && self.read {
+            return true;
+        }
+
         let repo_patterns = self.repo_patterns();
         let repo_perm = repo_patterns.get(repo);
 
@@ -1056,6 +1081,7 @@ mod tests {
     #[test]
     fn test_github_scope_is_allowed() {
         let scope = GithubScope {
+            read: false,
             repos: [
                 ("owner/*".into(), GhRepoPermission::read_only()),
                 ("owner/writable".into(), GhRepoPermission::with_draft()),
@@ -1124,6 +1150,7 @@ mod tests {
     #[test]
     fn test_github_scope_is_read_allowed() {
         let scope = GithubScope {
+            read: false,
             repos: [
                 ("owner/*".into(), GhRepoPermission::read_only()),
                 ("other/repo".into(), GhRepoPermission::read_only()),
@@ -1141,8 +1168,147 @@ mod tests {
     }
 
     #[test]
+    fn test_github_scope_global_read() {
+        // Table-driven test for global read behavior
+        struct TestCase {
+            name: &'static str,
+            global_read: bool,
+            graphql_setting: GraphQlPermission,
+            repos: Vec<(&'static str, GhRepoPermission)>,
+            // Expected results
+            expect_global_read_allowed: bool,
+            expect_graphql_allowed: bool,
+            // (repo, expected_read_allowed)
+            read_checks: Vec<(&'static str, bool)>,
+            // (repo, op, expected_allowed)
+            op_checks: Vec<(&'static str, GhOpType, bool)>,
+        }
+
+        let cases = vec![
+            TestCase {
+                name: "global_read_true_no_repos",
+                global_read: true,
+                graphql_setting: GraphQlPermission::None,
+                repos: vec![],
+                expect_global_read_allowed: true,
+                expect_graphql_allowed: true, // implicitly enabled by global read
+                read_checks: vec![
+                    ("any/repo", true),
+                    ("unknown/random", true),
+                    ("foo/bar", true),
+                ],
+                op_checks: vec![
+                    ("any/repo", GhOpType::Read, true),
+                    ("any/repo", GhOpType::Write, false),
+                    ("any/repo", GhOpType::CreateDraft, false),
+                    ("any/repo", GhOpType::ManagePendingReview, false),
+                ],
+            },
+            TestCase {
+                name: "global_read_false_with_repos",
+                global_read: false,
+                graphql_setting: GraphQlPermission::None,
+                repos: vec![
+                    ("owner/*", GhRepoPermission::read_only()),
+                    ("specific/repo", GhRepoPermission::with_draft()),
+                ],
+                expect_global_read_allowed: false,
+                expect_graphql_allowed: false,
+                read_checks: vec![
+                    ("owner/foo", true),
+                    ("owner/bar", true),
+                    ("specific/repo", true),
+                    ("unknown/repo", false),
+                ],
+                op_checks: vec![
+                    ("owner/foo", GhOpType::Read, true),
+                    ("owner/foo", GhOpType::CreateDraft, false),
+                    ("specific/repo", GhOpType::CreateDraft, true),
+                    ("unknown/repo", GhOpType::Read, false),
+                ],
+            },
+            TestCase {
+                name: "global_read_false_graphql_explicit",
+                global_read: false,
+                graphql_setting: GraphQlPermission::Read,
+                repos: vec![],
+                expect_global_read_allowed: false,
+                expect_graphql_allowed: true,
+                read_checks: vec![("any/repo", false)],
+                op_checks: vec![],
+            },
+            TestCase {
+                name: "global_read_true_with_write_repos",
+                global_read: true,
+                graphql_setting: GraphQlPermission::None,
+                repos: vec![("writable/repo", GhRepoPermission::full_write())],
+                expect_global_read_allowed: true,
+                expect_graphql_allowed: true,
+                read_checks: vec![("writable/repo", true), ("other/repo", true)],
+                op_checks: vec![
+                    ("writable/repo", GhOpType::Write, true),
+                    ("writable/repo", GhOpType::CreateDraft, true),
+                    ("other/repo", GhOpType::Read, true),
+                    ("other/repo", GhOpType::Write, false),
+                ],
+            },
+        ];
+
+        for case in cases {
+            let scope = GithubScope {
+                read: case.global_read,
+                repos: case
+                    .repos
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+                prs: HashMap::new(),
+                issues: HashMap::new(),
+                graphql: case.graphql_setting,
+            };
+
+            assert_eq!(
+                scope.global_read_allowed(),
+                case.expect_global_read_allowed,
+                "{}: global_read_allowed mismatch",
+                case.name
+            );
+            assert_eq!(
+                scope.graphql_read_allowed(),
+                case.expect_graphql_allowed,
+                "{}: graphql_read_allowed mismatch",
+                case.name
+            );
+
+            for (repo, expected) in case.read_checks {
+                assert_eq!(
+                    scope.is_read_allowed(repo),
+                    expected,
+                    "{}: is_read_allowed({}) expected {}",
+                    case.name,
+                    repo,
+                    expected
+                );
+            }
+
+            for (repo, op, expected) in case.op_checks {
+                assert_eq!(
+                    scope.is_allowed(repo, op.clone(), None),
+                    expected,
+                    "{}: is_allowed({}, {:?}) expected {}",
+                    case.name,
+                    repo,
+                    op,
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_github_scope_graphql_permissions() {
         let scope_none = GithubScope {
+            read: false,
             repos: HashMap::new(),
             prs: HashMap::new(),
             issues: HashMap::new(),
@@ -1151,6 +1317,7 @@ mod tests {
         assert!(!scope_none.graphql_read_allowed());
 
         let scope_read = GithubScope {
+            read: false,
             repos: HashMap::new(),
             prs: HashMap::new(),
             issues: HashMap::new(),
@@ -1220,6 +1387,103 @@ mod tests {
         assert!(!config.gh.graphql_read_allowed());
     }
 
+    #[test]
+    fn test_config_deserialization_global_read() {
+        // Table-driven test for global read config parsing
+        struct TestCase {
+            name: &'static str,
+            toml: &'static str,
+            expect_global_read: bool,
+            expect_graphql: bool,
+            expect_repo_read: Option<(&'static str, bool)>,
+        }
+
+        let cases = vec![
+            TestCase {
+                name: "read_true_only",
+                toml: r#"
+                    [gh]
+                    read = true
+                "#,
+                expect_global_read: true,
+                expect_graphql: true, // implicitly enabled
+                expect_repo_read: Some(("any/repo", true)),
+            },
+            TestCase {
+                name: "read_false_explicit",
+                toml: r#"
+                    [gh]
+                    read = false
+                "#,
+                expect_global_read: false,
+                expect_graphql: false,
+                expect_repo_read: Some(("any/repo", false)),
+            },
+            TestCase {
+                name: "read_true_with_graphql_none",
+                toml: r#"
+                    [gh]
+                    read = true
+                    graphql = "none"
+                "#,
+                expect_global_read: true,
+                expect_graphql: true, // global read overrides graphql=none
+                expect_repo_read: None,
+            },
+            TestCase {
+                name: "read_not_specified_defaults_false",
+                toml: r#"
+                    [gh.repos]
+                    "owner/repo" = { read = true }
+                "#,
+                expect_global_read: false,
+                expect_graphql: false,
+                expect_repo_read: Some(("owner/repo", true)),
+            },
+            TestCase {
+                name: "read_true_with_repos",
+                toml: r#"
+                    [gh]
+                    read = true
+
+                    [gh.repos]
+                    "special/repo" = { read = true, write = true }
+                "#,
+                expect_global_read: true,
+                expect_graphql: true,
+                expect_repo_read: Some(("other/repo", true)), // global read allows any
+            },
+        ];
+
+        for case in cases {
+            let config: ScopeConfig = toml::from_str(case.toml)
+                .unwrap_or_else(|e| panic!("{}: parse error: {}", case.name, e));
+
+            assert_eq!(
+                config.gh.global_read_allowed(),
+                case.expect_global_read,
+                "{}: global_read_allowed mismatch",
+                case.name
+            );
+            assert_eq!(
+                config.gh.graphql_read_allowed(),
+                case.expect_graphql,
+                "{}: graphql_read_allowed mismatch",
+                case.name
+            );
+
+            if let Some((repo, expected)) = case.expect_repo_read {
+                assert_eq!(
+                    config.gh.is_read_allowed(repo),
+                    expected,
+                    "{}: is_read_allowed({}) mismatch",
+                    case.name,
+                    repo
+                );
+            }
+        }
+    }
+
     // ========================================================================
     // Tests for pending-review permission
     // ========================================================================
@@ -1242,6 +1506,7 @@ mod tests {
     #[test]
     fn test_github_scope_is_allowed_pending_review() {
         let scope = GithubScope {
+            read: false,
             repos: [
                 ("owner/readonly".into(), GhRepoPermission::read_only()),
                 (
