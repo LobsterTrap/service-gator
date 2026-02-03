@@ -355,6 +355,7 @@ mod tests {
     fn test_format_in_struct_debug() {
         // Test that secrets are redacted even when embedded in structs
         #[derive(Debug)]
+        #[allow(dead_code)]
         struct Config {
             token: ApiToken,
             secret: SecretString,

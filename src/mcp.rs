@@ -934,29 +934,30 @@ impl ServiceGatorServer {
             }
             if !config.gh.graphql_read_allowed() {
                 return Ok(CallToolResult::error(vec![Content::text(
-                    "GraphQL read access not allowed. Set `graphql = \"read\"` or `graphql = true` in [gh] config.",
+                    "GraphQL read access not allowed. Set `read = true` or `graphql = \"read\"` in [gh] config.",
                 )]));
             }
         }
 
-        // Extract repo from endpoint path
+        // Extract repo from endpoint path (may be None for global endpoints like /search, /gists)
         let repo = github::extract_repo_from_api_path(endpoint);
-        let repo = match repo {
-            Some(r) => r,
-            None => {
-                return Ok(CallToolResult::error(vec![Content::text(
-                    "Could not determine target repository from API path. \
-                     Use path like repos/owner/repo/...",
-                )]));
-            }
-        };
 
         // Extract resource ref (e.g., "pr/123" or "issue/456") for scoped write permissions
         let resource_ref = github::extract_resource_from_api_path(endpoint);
 
         // Permission check
         if is_write {
-            // For writes, check WriteResource permission (can be scoped to PR/issue)
+            // For writes, we require a repo
+            let repo = match repo {
+                Some(r) => r,
+                None => {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        "Write operations require a repository path. \
+                         Use path like repos/owner/repo/...",
+                    )]));
+                }
+            };
+            // Check WriteResource permission (can be scoped to PR/issue)
             if !config
                 .gh
                 .is_allowed(&repo, GhOpType::WriteResource, resource_ref.as_deref())
@@ -980,11 +981,25 @@ impl ServiceGatorServer {
                 "github API write operation"
             );
         } else {
-            // For reads, check read permission
-            if !config.gh.is_read_allowed(&repo) {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Read access not allowed for repository: {repo}"
-                ))]));
+            // For reads, check permission based on whether we have a repo
+            match repo {
+                Some(ref repo) => {
+                    // Have a repo - check per-repo or global permission
+                    if !config.gh.is_read_allowed(repo) {
+                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                            "Read access not allowed for repository: {repo}"
+                        ))]));
+                    }
+                }
+                None => {
+                    // No repo in path (e.g., /search, /gists, /user) - require global read
+                    if !config.gh.global_read_allowed() {
+                        return Ok(CallToolResult::error(vec![Content::text(
+                            "This endpoint requires global read access. \
+                             Set `read = true` in [gh] config, or use /repos/owner/repo/... paths.",
+                        )]));
+                    }
+                }
             }
             // Count read operation (logged in aggregate)
             self.logging.read_ops.increment();
@@ -2276,29 +2291,49 @@ fn check_github_availability(config: &ScopeConfig) -> ServiceStatus {
     // Check for GH_TOKEN environment variable
     let has_token = std::env::var("GH_TOKEN").is_ok();
 
+    // Check if global read is enabled
+    let has_global_read = config.gh.global_read_allowed();
+
     // Check if any repos are configured
     let has_repos = !config.gh.repos.is_empty();
 
-    if has_token && has_repos {
-        let repo_count = config.gh.repos.len();
+    // Check if GraphQL is enabled (either via global read or explicit graphql setting)
+    let has_graphql = config.gh.graphql_read_allowed();
+
+    if has_token && has_global_read {
+        let mut details =
+            "Authenticated, global read access (all repos, search, gists)".to_string();
+        if has_graphql {
+            details.push_str(" + GraphQL");
+        }
         ServiceStatus {
             available: true,
-            details: format!("Authenticated, {} repositories in scope", repo_count),
+            details,
+        }
+    } else if has_token && has_repos {
+        let repo_count = config.gh.repos.len();
+        let mut details = format!("Authenticated, {} repositories in scope", repo_count);
+        if has_graphql {
+            details.push_str(" + GraphQL");
+        }
+        ServiceStatus {
+            available: true,
+            details,
         }
     } else if has_token {
         ServiceStatus {
             available: false,
-            details: "Token available but no repositories configured".to_string(),
+            details: "Token available but no repositories configured (set `read = true` in [gh] for global access)".to_string(),
         }
-    } else if has_repos {
+    } else if has_repos || has_global_read {
         ServiceStatus {
             available: false,
-            details: "Repositories configured but missing GH_TOKEN".to_string(),
+            details: "Configuration present but missing GH_TOKEN".to_string(),
         }
     } else {
         ServiceStatus {
             available: false,
-            details: "Missing GH_TOKEN and repository configuration".to_string(),
+            details: "Missing GH_TOKEN and configuration".to_string(),
         }
     }
 }
