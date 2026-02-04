@@ -336,10 +336,10 @@ admin-key = "admin-key"
 mode = "optional"
 
 [gh.repos]
-"{}" = {{ read = true, create-draft = true, push-new-branch = false, write = false }}
+"{}" = {{ read = true, create-draft = false, push-new-branch = true, write = false }}
 
 [gitlab.projects]
-"testgroup/testproject" = {{ read = true, create-draft = true, push-new-branch = false }}
+"testgroup/testproject" = {{ read = true, create-draft = false, push-new-branch = true }}
 "#,
         test_repo
     );

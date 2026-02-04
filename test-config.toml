@@ -1,0 +1,49 @@
+# Test configuration for service-gator REST API
+
+[server]
+mode = "none"  # No authentication for testing
+
+[gh]
+# Allow read access to any repository
+read = true
+
+[gh.repos]
+# Allow specific test repositories
+"octocat/Hello-World" = { read = true, write = true, create-draft = true }
+"cgwalters/service-gator" = { read = true, write = true, create-draft = true }
+
+[gitlab.projects]
+# Allow access to test GitLab projects
+"gitlab-org/gitlab" = { read = true, write = true, create_draft = true }
+"gitlab-examples/static-site" = { read = true, write = true, create_draft = true }
+"test-group/test-project" = { read = true, write = true, create_draft = true }
+
+# Forgejo/Gitea configurations for multiple hosts
+[[forgejo]]
+host = "codeberg.org"
+
+[forgejo.repos]
+# Allow access to test Forgejo repositories
+"forgejo/forgejo" = { read = true, write = true, create_draft = true }
+"user/*" = { read = true }
+"test/repo" = { read = true, write = true, create_draft = true }
+
+[[forgejo]]
+host = "git.example.com"
+
+[forgejo.repos]
+# Example private Forgejo instance
+"company/project" = { read = true, write = true }
+"team/*" = { read = true }
+
+[jira]
+# JIRA configuration - set real values in environment variables or config file
+# host = "https://your-instance.atlassian.net"
+# username = "your-email@example.com"
+# token will be read from JIRA_API_TOKEN environment variable
+
+[jira.projects]
+# Example JIRA projects - replace with real project keys
+"TEST" = { read = true, create = true, write = true }
+"DEMO" = { read = true, create = true }
+"PROJ" = { read = true }

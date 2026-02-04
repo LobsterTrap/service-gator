@@ -22,6 +22,7 @@ mod tests {
     pub mod jira;
     pub mod mcp_server;
     pub mod push_new_branch_tests;
+    pub mod rest_api;
     pub mod rmcp_client;
     pub mod status_tests;
 }

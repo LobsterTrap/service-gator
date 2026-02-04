@@ -37,6 +37,10 @@ tokio = { workspace = true }
 tokio-util = "0.7"
 axum = "0.8"
 http = "1"
+# HTTP proxy functionality
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
 eyre = { workspace = true }
 # Native Forgejo/Gitea API client
 forgejo-api = "0.9"
@@ -60,6 +64,7 @@ tempfile = "3.24.0"
 # Pin time to avoid 0.3.47 which has compile-time assertions that fail on older Rust
 # See: https://github.com/time-rs/time/issues/836
 time = ">=0.3,<0.3.47"
+urlencoding = "2.1"
 
 [dev-dependencies]
 cap-std-ext = "4.0.7"

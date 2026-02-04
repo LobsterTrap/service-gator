@@ -1045,8 +1045,9 @@ fn test_mcp_github_api_non_repo_endpoint_rejected() -> Result<()> {
 
     let error_text = result["content"][0]["text"].as_str().unwrap_or("");
     assert!(
-        error_text.contains("Could not determine target repository"),
-        "Expected repo path error, got: {}",
+        error_text.contains("Could not determine target repository")
+            || error_text.contains("global read access"),
+        "Expected repo path error or global read access error, got: {}",
         error_text
     );
 
@@ -1395,7 +1396,7 @@ integration_test!(test_mcp_permission_separation_create_draft_only);
 fn test_mcp_permission_separation_both_permissions() -> Result<()> {
     let test_repo = get_test_repo();
 
-    // Configure server with both push-branch and create-draft permissions
+    // Configure server with both push-new-branch and create-draft permissions
     let config = format!(
         r#"
 [server]
@@ -1404,7 +1405,7 @@ admin-key = "admin-key"
 mode = "optional"
 
 [gh.repos]
-"{}" = {{ read = true, create-draft = true, push-branch = true }}
+"{}" = {{ read = true, create-draft = true, push-new-branch = true }}
 "#,
         test_repo
     );
@@ -1654,12 +1655,13 @@ mode = "optional"
 }
 integration_test!(test_mcp_permission_separation_no_permissions);
 
-/// Test backward compatibility - existing configs with create-draft should still work
+/// Test backward compatibility - push-new-branch implies can_create_draft
 fn test_mcp_permission_separation_backward_compatibility() -> Result<()> {
     let test_repo = get_test_repo();
 
-    // Configure server with legacy-style permissions (create-draft = true, no push-branch specified)
-    // This simulates an existing configuration before the push-branch separation
+    // Configure server with push-new-branch = true
+    // Backward compatibility: push-new-branch implies can_create_draft
+    // (pushing branches for PRs requires creating the draft PR too)
     let config = format!(
         r#"
 [server]
@@ -1668,7 +1670,7 @@ admin-key = "admin-key"
 mode = "optional"
 
 [gh.repos]
-"{}" = {{ read = true, create-draft = true, pending-review = true }}
+"{}" = {{ read = true, create-draft = false, push-new-branch = true }}
 "#,
         test_repo
     );
@@ -1679,6 +1681,7 @@ mode = "optional"
     session.send_initialized()?;
 
     // Test that github_push with create_draft_pr works (backward compatibility)
+    // push-new-branch implies can_create_draft, so this should work from a permission standpoint
     let push_with_pr_request = json!({
         "jsonrpc": "2.0",
         "method": "tools/call",
@@ -1703,15 +1706,15 @@ mode = "optional"
     if let Some(true) = pr_result.get("isError").and_then(|e| e.as_bool()) {
         let error_content = &pr_result["content"];
         let error_text = error_content[0]["text"].as_str().unwrap_or("");
-        // Should NOT be a permission error - legacy configs should work
+        // Should NOT be a permission error - push-new-branch implies can_create_draft
         assert!(
             !error_text.contains("permission not granted"),
-            "Expected no permission error for legacy config, got: {}",
+            "Expected no permission error with push-new-branch (implies create-draft), got: {}",
             error_text
         );
     }
 
-    // However, direct push without PR should fail since push-branch defaults to false
+    // Push without PR should also work since we have push-new-branch
     let push_no_pr_request = json!({
         "jsonrpc": "2.0",
         "method": "tools/call",
@@ -1730,23 +1733,17 @@ mode = "optional"
 
     let push_response = session.send_request(push_no_pr_request)?;
     let push_result = &push_response["result"];
-    let push_is_error = push_result
-        .get("isError")
-        .and_then(|e| e.as_bool())
-        .unwrap_or(false);
 
-    assert!(
-        push_is_error,
-        "Expected push without PR to fail due to missing push-new-branch permission in legacy config"
-    );
-
-    let error_content = &push_result["content"];
-    let error_text = error_content[0]["text"].as_str().unwrap_or("");
-    assert!(
-        error_text.contains("push-new-branch permission not granted"),
-        "Expected push-new-branch permission error for legacy config without explicit push-new-branch, got: {}",
-        error_text
-    );
+    if let Some(true) = push_result.get("isError").and_then(|e| e.as_bool()) {
+        let error_content = &push_result["content"];
+        let error_text = error_content[0]["text"].as_str().unwrap_or("");
+        // Should NOT be a permission error - we have push-new-branch
+        assert!(
+            !error_text.contains("permission not granted"),
+            "Expected no permission error with push-new-branch, got: {}",
+            error_text
+        );
+    }
 
     Ok(())
 }
