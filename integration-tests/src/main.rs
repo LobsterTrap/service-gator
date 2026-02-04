@@ -21,6 +21,7 @@ mod tests {
     pub mod forgejo;
     pub mod jira;
     pub mod mcp_server;
+    pub mod push_new_branch_tests;
     pub mod rmcp_client;
     pub mod status_tests;
 }
