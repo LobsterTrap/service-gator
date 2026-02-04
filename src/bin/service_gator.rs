@@ -26,6 +26,7 @@ use service_gator::scope::{
     ForgejoRepoPermission, ForgejoScope, GhRepoPermission, GlProjectPermission,
     JiraProjectPermission, ScopeConfig,
 };
+use service_gator::servers::{run_servers, ServerMode};
 
 /// Initialize tracing with env-filter support (RUST_LOG).
 fn init_tracing() {
@@ -52,6 +53,21 @@ struct Cli {
     /// Start MCP server on the given address (e.g., 127.0.0.1:8080)
     #[arg(long = "mcp-server", value_name = "ADDR")]
     mcp_server: Option<String>,
+
+    /// Start REST API server on the given address (e.g., 127.0.0.1:8081)
+    #[arg(long = "rest-server", value_name = "ADDR")]
+    rest_server: Option<String>,
+
+    /// Start both MCP and REST servers (dual mode)
+    /// MCP server runs on --mcp-server address (default: 127.0.0.1:8080)
+    /// REST server runs on --rest-server address (default: 127.0.0.1:8081)
+    #[arg(long = "dual-mode")]
+    dual_mode: bool,
+
+    /// Start HTTP proxy server on the given address (e.g., 127.0.0.1:8082)
+    /// Transparent proxy for CLI tools like gh, glab, etc.
+    #[arg(long = "http-proxy", value_name = "ADDR")]
+    http_proxy: Option<String>,
 
     /// Path to a TOML configuration file
     #[arg(long = "config", value_name = "PATH")]
@@ -219,9 +235,21 @@ fn try_main() -> Result<ExitCode> {
     // Build config from file + CLI args
     let server_config = build_config(&cli)?;
 
-    // MCP server mode
-    if let Some(addr) = cli.mcp_server {
-        return run_mcp_server(&addr, server_config, cli.scope_file);
+// Server mode - determine which server(s) to start
+    let server_mode = determine_server_mode(&cli)?;
+    if let Some((mode, mcp_addr, rest_addr)) = server_mode {
+        return run_servers_mode(
+            mode,
+            mcp_addr.as_deref(),
+            rest_addr.as_deref(),
+            server_config,
+            cli.scope_file.clone(),
+        );
+    }
+
+    // HTTP proxy mode (separate from MCP/REST servers)
+    if let Some(addr) = cli.http_proxy {
+        return run_proxy_server(&addr, server_config);
     }
 
     // For CLI commands, we only need the scope config
@@ -236,26 +264,87 @@ fn try_main() -> Result<ExitCode> {
     }
 }
 
-/// Run the MCP server.
-fn run_mcp_server(
-    addr: &str,
+/// Run the HTTP proxy server.
+fn run_proxy_server(addr: &str, config: ServerConfig) -> Result<ExitCode> {
+    let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
+    rt.block_on(service_gator::proxy::start_proxy_server(addr, config))
+        .context("HTTP proxy server failed")?;
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Determine which server mode to use based on CLI flags.
+#[allow(clippy::type_complexity)]
+fn determine_server_mode(
+    cli: &Cli,
+) -> Result<Option<(ServerMode, Option<String>, Option<String>)>> {
+    let has_mcp = cli.mcp_server.is_some();
+    let has_rest = cli.rest_server.is_some();
+    let dual_mode = cli.dual_mode;
+
+    match (has_mcp, has_rest, dual_mode) {
+        // No server flags
+        (false, false, false) => Ok(None),
+
+        // Single server modes
+        (true, false, false) => Ok(Some((ServerMode::Mcp, cli.mcp_server.clone(), None))),
+        (false, true, false) => Ok(Some((ServerMode::Rest, None, cli.rest_server.clone()))),
+
+        // Dual mode variants
+        (false, false, true) => {
+            // Use defaults for both
+            Ok(Some((
+                ServerMode::Dual,
+                Some("127.0.0.1:8080".to_string()),
+                Some("127.0.0.1:8081".to_string()),
+            )))
+        }
+        (true, false, true) => {
+            // MCP specified, use default for REST
+            Ok(Some((
+                ServerMode::Dual,
+                cli.mcp_server.clone(),
+                Some("127.0.0.1:8081".to_string()),
+            )))
+        }
+        (false, true, true) => {
+            // REST specified, use default for MCP
+            Ok(Some((
+                ServerMode::Dual,
+                Some("127.0.0.1:8080".to_string()),
+                cli.rest_server.clone(),
+            )))
+        }
+        (true, true, false) => {
+            // Both servers specified without --dual-mode, treat as dual mode
+            Ok(Some((
+                ServerMode::Dual,
+                cli.mcp_server.clone(),
+                cli.rest_server.clone(),
+            )))
+        }
+        (true, true, true) => {
+            // Both servers specified with --dual-mode
+            Ok(Some((
+                ServerMode::Dual,
+                cli.mcp_server.clone(),
+                cli.rest_server.clone(),
+            )))
+        }
+    }
+}
+
+/// Run server(s) based on the determined mode.
+fn run_servers_mode(
+    mode: ServerMode,
+    mcp_addr: Option<&str>,
+    rest_addr: Option<&str>,
     config: ServerConfig,
     scope_file: Option<std::path::PathBuf>,
 ) -> Result<ExitCode> {
     let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
-
-    rt.block_on(async {
-        // Set up scopes: file-watched if --scope-file provided, static otherwise
-        let scopes = match scope_file {
-            Some(path) => service_gator::config_watcher::watch_scopes(&path)
-                .await
-                .with_context(|| format!("loading scope file {}", path.display()))?,
-            None => service_gator::config_watcher::static_scopes(config.scopes.clone()),
-        };
-
-        service_gator::mcp::start_mcp_server(addr, config, scopes).await
-    })
-    .context("MCP server failed")?;
+    rt.block_on(run_servers(mode, mcp_addr, rest_addr, config, scope_file))
+        .context("server(s) failed")?;
 
     Ok(ExitCode::SUCCESS)
 }

@@ -185,7 +185,7 @@ pub fn extract_project_from_api_path(path: &str) -> Option<String> {
 ///
 /// GitLab project paths typically only need `%2F` -> `/` decoding.
 /// We also handle a few other common cases for robustness.
-fn decode_project_path(encoded: &str) -> String {
+pub fn decode_project_path(encoded: &str) -> String {
     encoded
         .replace("%2F", "/")
         .replace("%2f", "/")

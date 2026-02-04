@@ -1068,6 +1068,68 @@ pub struct JiraScope {
     pub issues: HashMap<JiraIssueKey, JiraIssuePermission>,
 }
 
+impl JiraScope {
+    /// Check if an operation is allowed for a project or issue.
+    pub fn is_allowed(&self, project: &str, op: OpType, issue_key: Option<&str>) -> bool {
+        // If we have specific issue permissions, check those first
+        if let Some(issue_key) = issue_key {
+            if let Ok(parsed_issue_key) = issue_key.parse::<JiraIssueKey>() {
+                if let Some(issue_perm) = self.issues.get(&parsed_issue_key) {
+                    return match op {
+                        OpType::Read => issue_perm.read,
+                        OpType::Write => issue_perm.write,
+                    };
+                }
+            }
+        }
+
+        // Fall back to project-level permissions
+        if let Ok(project_key) = project.parse::<JiraProjectKey>() {
+            if let Some(project_perm) = self.projects.get(&project_key) {
+                return match op {
+                    OpType::Read => project_perm.can_read(),
+                    OpType::Write => project_perm.can_write(),
+                };
+            }
+        }
+
+        false
+    }
+
+    /// Check if the user has any read access to any project.
+    pub fn has_any_read_access(&self) -> bool {
+        self.projects.values().any(|p| p.can_read()) || self.issues.values().any(|i| i.read)
+    }
+
+    /// Get JIRA host from config or environment.
+    pub fn host(&self) -> String {
+        self.host
+            .clone()
+            .or_else(|| std::env::var("JIRA_HOST").ok())
+            .unwrap_or_else(|| "https://jira.atlassian.net".to_string())
+    }
+
+    /// Get JIRA username from config or environment.
+    pub fn username(&self) -> String {
+        self.username
+            .clone()
+            .or_else(|| std::env::var("JIRA_USERNAME").ok())
+            .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "user".to_string()))
+    }
+
+    /// Get JIRA token from config or environment.
+    pub fn token(&self) -> String {
+        self.token
+            .as_ref()
+            .map(|t| t.expose_secret().to_string())
+            .or_else(|| std::env::var("JIRA_API_TOKEN").ok())
+            .unwrap_or_else(|| {
+                // This will fail later when trying to authenticate, but we return empty for now
+                "".to_string()
+            })
+    }
+}
+
 // ============================================================================
 // Top-level Config
 // ============================================================================
