@@ -219,7 +219,7 @@ pub struct GitPushLocalInput {
     /// - `gitlab:group/project` or `gitlab:group/subgroup/project` for GitLab
     /// - `forgejo:owner/repo` for Forgejo/Gitea
     ///
-    /// Must have `create-draft` or higher permission in the corresponding scope.
+    /// Must have `push-new-branch` or higher permission in the corresponding scope.
     pub target: String,
     /// Branch name to push to (e.g., "fix-typo").
     /// Will be prefixed with "agent-" automatically.
@@ -300,10 +300,223 @@ impl ServiceGatorServer {
             logging,
         }
     }
+}
 
-    /// Get a reference to the logging state for background task setup.
-    pub fn logging_state(&self) -> &LoggingState {
-        &self.logging
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scope::{GhRepoPermission, GithubScope, ScopeConfig};
+    use std::collections::HashMap;
+
+    /// Helper function to create a test ScopeConfig with specific GitHub permissions
+    fn create_test_scope_config(gh_repo_perms: Vec<(&str, GhRepoPermission)>) -> ScopeConfig {
+        ScopeConfig {
+            gh: GithubScope {
+                read: false,
+                repos: gh_repo_perms
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+                prs: HashMap::new(),
+                issues: HashMap::new(),
+                graphql: crate::scope::GraphQlPermission::None,
+            },
+            gitlab: Default::default(),
+            forgejo: Vec::new(),
+            jira: Default::default(),
+        }
+    }
+
+    #[test]
+    fn test_github_push_permission_enforcement() {
+        // Test that github_push correctly enforces push-new-branch permission
+
+        // Case 1: No push-new-branch permission should fail
+        let scope_no_push = create_test_scope_config(vec![(
+            "owner/repo",
+            GhRepoPermission {
+                read: true,
+                create_draft: true,
+                pending_review: false,
+                push_new_branch: false,
+                write: false,
+            },
+        )]);
+
+        // We can't easily test the full async function without setting up tokio runtime,
+        // but we can test the permission logic that drives the MCP handlers
+        assert!(!scope_no_push
+            .gh
+            .is_allowed("owner/repo", GhOpType::PushNewBranch, None));
+
+        // Case 2: With push-new-branch permission should not fail on permission check
+        let scope_with_push = create_test_scope_config(vec![(
+            "owner/repo",
+            GhRepoPermission {
+                read: true,
+                create_draft: true,
+                pending_review: false,
+                push_new_branch: true,
+                write: false,
+            },
+        )]);
+
+        assert!(scope_with_push
+            .gh
+            .is_allowed("owner/repo", GhOpType::PushNewBranch, None));
+    }
+
+    #[test]
+    fn test_gh_create_branch_permission_enforcement() {
+        // Test that gh_create_branch correctly enforces push-new-branch permission
+
+        // Case 1: No push-new-branch permission should be denied
+        let scope_no_push = create_test_scope_config(vec![(
+            "owner/repo",
+            GhRepoPermission {
+                read: true,
+                create_draft: true,
+                pending_review: false,
+                push_new_branch: false,
+                write: false,
+            },
+        )]);
+
+        assert!(!scope_no_push
+            .gh
+            .is_allowed("owner/repo", GhOpType::PushNewBranch, None));
+
+        // Case 2: With push-new-branch permission should be allowed
+        let scope_with_push = create_test_scope_config(vec![(
+            "owner/repo",
+            GhRepoPermission {
+                read: true,
+                create_draft: true,
+                pending_review: false,
+                push_new_branch: true,
+                write: false,
+            },
+        )]);
+
+        assert!(scope_with_push
+            .gh
+            .is_allowed("owner/repo", GhOpType::PushNewBranch, None));
+
+        // Case 3: Write permission should also allow push-new-branch
+        let scope_with_write =
+            create_test_scope_config(vec![("owner/repo", GhRepoPermission::full_write())]);
+
+        assert!(scope_with_write
+            .gh
+            .is_allowed("owner/repo", GhOpType::PushNewBranch, None));
+    }
+
+    #[test]
+    fn test_permission_error_message_triggers() {
+        // Test that permission denial produces the conditions that trigger specific error messages
+        // The actual MCP handlers would return errors like:
+        // - "push-new-branch permission not granted for repository: owner/repo"
+        // - "push-new-branch permission not granted for github:owner/repo"
+
+        let scope_no_push = create_test_scope_config(vec![(
+            "owner/repo",
+            GhRepoPermission {
+                read: true,
+                create_draft: true,
+                pending_review: false,
+                push_new_branch: false,
+                write: false,
+            },
+        )]);
+
+        // These operations should be denied, triggering error messages
+        assert!(!scope_no_push
+            .gh
+            .is_allowed("owner/repo", GhOpType::PushNewBranch, None));
+
+        // Unknown repository should also be denied
+        assert!(!scope_no_push
+            .gh
+            .is_allowed("unknown/repo", GhOpType::PushNewBranch, None));
+        assert!(!scope_no_push
+            .gh
+            .is_allowed("unknown/repo", GhOpType::Read, None));
+    }
+
+    #[test]
+    fn test_git_push_local_permission_enforcement() {
+        // Test permission enforcement logic for git_push_local
+        // (The actual implementation checks GitLab and Forgejo scopes)
+
+        // Test GitLab permission checking
+        let gitlab_scope = crate::scope::GitLabScope {
+            projects: [
+                (
+                    "group/allowed".to_string(),
+                    crate::scope::GlProjectPermission::with_push_new_branch(),
+                ),
+                (
+                    "group/denied".to_string(),
+                    crate::scope::GlProjectPermission::read_only(),
+                ),
+            ]
+            .into(),
+            mrs: HashMap::new(),
+            issues: HashMap::new(),
+            graphql: crate::scope::GraphQlPermission::None,
+            host: None,
+        };
+
+        assert!(gitlab_scope.is_allowed(
+            "group/allowed",
+            crate::scope::GlOpType::PushNewBranch,
+            None
+        ));
+        assert!(!gitlab_scope.is_allowed(
+            "group/denied",
+            crate::scope::GlOpType::PushNewBranch,
+            None
+        ));
+        assert!(!gitlab_scope.is_allowed(
+            "group/unknown",
+            crate::scope::GlOpType::PushNewBranch,
+            None
+        ));
+
+        // Test Forgejo permission checking
+        let forgejo_scopes = vec![crate::scope::ForgejoScope {
+            host: "codeberg.org".to_string(),
+            token: None,
+            repos: [
+                (
+                    "user/allowed".to_string(),
+                    crate::scope::ForgejoRepoPermission::with_push_new_branch(),
+                ),
+                (
+                    "user/denied".to_string(),
+                    crate::scope::ForgejoRepoPermission::read_only(),
+                ),
+            ]
+            .into(),
+            prs: HashMap::new(),
+            issues: HashMap::new(),
+        }];
+
+        assert!(forgejo_scopes[0].is_allowed(
+            "user/allowed",
+            crate::scope::ForgejoOpType::PushNewBranch,
+            None
+        ));
+        assert!(!forgejo_scopes[0].is_allowed(
+            "user/denied",
+            crate::scope::ForgejoOpType::PushNewBranch,
+            None
+        ));
+        assert!(!forgejo_scopes[0].is_allowed(
+            "user/unknown",
+            crate::scope::ForgejoOpType::PushNewBranch,
+            None
+        ));
     }
 }
 
@@ -495,13 +708,13 @@ impl ServiceGatorServer {
                     .to_string());
             }
             "gitlab" => {
-                // Permission check - GitLab requires create-draft permission
+                // Permission check - GitLab requires push-new-branch permission
                 if !config
                     .gitlab
-                    .is_allowed(repo_path, crate::scope::GlOpType::CreateDraft, None)
+                    .is_allowed(repo_path, crate::scope::GlOpType::PushNewBranch, None)
                 {
                     return Err(format!(
-                        "create-draft permission not granted for gitlab:{}",
+                        "push-new-branch permission not granted for gitlab:{}",
                         repo_path
                     ));
                 }
@@ -509,20 +722,21 @@ impl ServiceGatorServer {
                     .ok_or("No GitLab token available (GITLAB_TOKEN not set)")?;
                 // Use configured host or default to gitlab.com
                 let host = config.gitlab.host.as_deref().unwrap_or("gitlab.com");
+
                 let url = format!("https://oauth2:{}@{}/{}.git", token, host, repo_path);
                 (url, format!("gitlab:{}", repo_path))
             }
             "forgejo" => {
-                // Find the matching Forgejo scope with create-draft permission
+                // Find the matching Forgejo scope with push-new-branch permission
                 let scope = config
                     .forgejo
                     .iter()
                     .find(|s| {
-                        s.is_allowed(repo_path, crate::scope::ForgejoOpType::CreateDraft, None)
+                        s.is_allowed(repo_path, crate::scope::ForgejoOpType::PushNewBranch, None)
                     })
                     .ok_or_else(|| {
                         format!(
-                            "create-draft permission not granted for forgejo:{}",
+                            "push-new-branch permission not granted for forgejo:{}",
                             repo_path
                         )
                     })?;
@@ -533,6 +747,7 @@ impl ServiceGatorServer {
                     .or_else(|| std::env::var("FORGEJO_TOKEN").ok())
                     .filter(|t| !t.is_empty())
                     .ok_or("No Forgejo token available")?;
+
                 let url = format!(
                     "https://{}:{}@{}/{}.git",
                     "token", token, scope.host, repo_path
@@ -674,10 +889,20 @@ impl ServiceGatorServer {
         let repo_string = input.repo.as_str();
         let repo = repo_string.as_str();
 
-        // Permission check
-        if !config.gh.is_allowed(repo, GhOpType::CreateDraft, None) {
+        // Permission check for branch pushing
+        if !config.gh.is_allowed(repo, GhOpType::PushNewBranch, None) {
             return Err(format!(
-                "create-draft permission not granted for github:{}",
+                "push-new-branch permission not granted for github:{}",
+                repo
+            ));
+        }
+
+        // If creating a draft PR, also check for CreateDraft permission
+        if input.create_draft_pr && !config.gh.is_allowed(repo, GhOpType::CreateDraft, None) {
+            return Err(format!(
+                "create-draft permission not granted for github:{}. \
+                 For github_push with create_draft_pr=true, both push-new-branch \
+                 and create-draft permissions are required.",
                 repo
             ));
         }
@@ -1350,7 +1575,7 @@ impl ServiceGatorServer {
     /// This tool allows sandboxed AI agents to create new branches for PRs.
     /// Branch names are enforced to use the `agent-` prefix for safety.
     #[tool(
-        description = "Create a new branch for a draft PR. Branch names are enforced to start with 'agent-' prefix (e.g., 'agent-42-fix-typo' or 'agent-add-feature'). The branch must NOT already exist. Requires create-draft permission."
+        description = "Create a new branch for a draft PR. Branch names are enforced to start with 'agent-' prefix (e.g., 'agent-42-fix-typo' or 'agent-add-feature'). The branch must NOT already exist. Requires push-new-branch permission."
     )]
     async fn gh_create_branch(
         &self,
@@ -1360,10 +1585,13 @@ impl ServiceGatorServer {
         let config = get_scopes_from_parts(&parts)?;
         let repo_str = input.repo.to_string();
 
-        // Check permission - requires create-draft or higher
-        if !config.gh.is_allowed(&repo_str, GhOpType::CreateDraft, None) {
+        // Check permission - requires push-new-branch or higher
+        if !config
+            .gh
+            .is_allowed(&repo_str, GhOpType::PushNewBranch, None)
+        {
             return Ok(CallToolResult::error(vec![Content::text(format!(
-                "create-draft permission not granted for repository: {}",
+                "push-new-branch permission not granted for repository: {}",
                 repo_str
             ))]));
         }
@@ -1395,7 +1623,7 @@ impl ServiceGatorServer {
 
         if ref_exists {
             return Ok(CallToolResult::error(vec![Content::text(format!(
-                "Branch '{}' already exists. For create-draft permission, \
+                "Branch '{}' already exists. For push-new-branch permission, \
                  you can only create NEW branches. Use a different description \
                  or issue number.",
                 branch
@@ -1461,7 +1689,7 @@ impl ServiceGatorServer {
     /// This tool allows pushing new commits to a PR that the agent has access to.
     /// The branch name is looked up from the PR - agents cannot specify arbitrary branches.
     #[tool(
-        description = "Update an existing PR's head branch with a new commit. The branch is looked up from the PR number - you cannot specify arbitrary branch names. Requires write permission on the PR or repository."
+        description = "Update an existing PR's head branch with a new commit. The branch is looked up from the PR number - you cannot specify arbitrary branch names. Requires push-new-branch or write permission on the repository."
     )]
     async fn gh_update_pr_head(
         &self,
@@ -1471,7 +1699,20 @@ impl ServiceGatorServer {
         let config = get_scopes_from_parts(&parts)?;
         let repo_str = input.repo.to_string();
 
-        // First, look up the PR to get the branch name
+        // Check permission first - need push-new-branch or write access to update a PR head
+        let has_write = config.gh.is_allowed(&repo_str, GhOpType::Write, None);
+        let has_push_new_branch = config
+            .gh
+            .is_allowed(&repo_str, GhOpType::PushNewBranch, None);
+
+        if !(has_write || has_push_new_branch) {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Cannot update PR #{} branch. push-new-branch permission not granted for repo {}",
+                input.pull_number, repo_str
+            ))]));
+        }
+
+        // Now look up the PR to get the branch name
         let pr_endpoint = format!("repos/{}/pulls/{}", repo_str, input.pull_number);
         let pr_args = vec!["api".to_string(), "--method=GET".to_string(), pr_endpoint];
 
@@ -1504,20 +1745,6 @@ impl ServiceGatorServer {
                 )]));
             }
         };
-
-        // Check permission - need write access since we're updating an existing branch
-        // OR the branch must be an agent- branch and we have create-draft
-        let has_write = config.gh.is_allowed(&repo_str, GhOpType::Write, None);
-        let is_agent_branch = branch_name.starts_with("agent-");
-        let has_create_draft = config.gh.is_allowed(&repo_str, GhOpType::CreateDraft, None);
-
-        if !(has_write || (is_agent_branch && has_create_draft)) {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "Cannot update PR #{} branch '{}'. Requires either: \
-                 (1) write permission, or (2) create-draft permission for agent-* branches.",
-                input.pull_number, branch_name
-            ))]));
-        }
 
         tracing::info!(
             operation = "gh_update_pr_head",

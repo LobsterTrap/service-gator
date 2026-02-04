@@ -1,7 +1,8 @@
 //! Integration tests for the MCP server with GitHub scope restrictions
 //!
 //! These tests verify that the MCP server correctly enforces scope restrictions
-//! when accessing GitHub repositories.
+//! when accessing GitHub repositories, including the new permission separation
+//! between push-branch and create-draft operations.
 
 use eyre::{Context, Result};
 use integration_tests::integration_test;
@@ -1099,3 +1100,654 @@ fn test_mcp_github_api_invalid_method_rejected() -> Result<()> {
     Ok(())
 }
 integration_test!(test_mcp_github_api_invalid_method_rejected);
+
+// ============================================================================
+// Permission Separation Integration Tests
+// ============================================================================
+
+/// Test that tools require correct permissions for push-new-branch vs create-draft separation
+fn test_mcp_permission_separation_push_new_branch_only() -> Result<()> {
+    let test_repo = get_test_repo();
+
+    // Configure server with only push-new-branch permission (no create-draft)
+    let config = format!(
+        r#"
+[server]
+secret = "test-secret"
+admin-key = "admin-key"
+mode = "optional"
+
+[gh.repos]
+"{}" = {{ read = true, create-draft = false, push-new-branch = true }}
+"#,
+        test_repo
+    );
+
+    let server = McpServerHandle::start(&config)?;
+    let mut session = McpSession::new(&server.mcp_url());
+    let _ = session.initialize()?;
+    session.send_initialized()?;
+
+    // Test github_push without PR (should work - only needs push-new-branch)
+    let push_no_pr_request = json!({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "github_push",
+            "arguments": {
+                "repo_path": "/workspaces/test-repo",
+                "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                "repo": test_repo,
+                "description": "test-push",
+                "create_draft_pr": false
+            }
+        },
+        "id": session.next_id()
+    });
+
+    let push_response = session.send_request(push_no_pr_request)?;
+    let push_result = &push_response["result"];
+
+    // Should fail because we don't have actual repo, but should not fail due to permissions
+    // The error should be about git/filesystem, not permissions
+    let push_is_error = push_result
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+
+    if push_is_error {
+        let error_content = &push_result["content"];
+        let error_text = error_content[0]["text"].as_str().unwrap_or("");
+        // Should NOT be a permission error
+        assert!(
+            !error_text.contains("push-new-branch permission not granted"),
+            "Expected no permission error for push-new-branch only operation, got: {}",
+            error_text
+        );
+        // Should be a filesystem/git error instead
+        assert!(
+            error_text.contains("Not a git repository") || error_text.contains("No such file"),
+            "Expected filesystem error, got: {}",
+            error_text
+        );
+    }
+
+    // Test github_push with PR (should fail - needs both push-new-branch and create-draft)
+    let push_with_pr_request = json!({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "github_push",
+            "arguments": {
+                "repo_path": "/workspaces/test-repo",
+                "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                "repo": test_repo,
+                "description": "test-push",
+                "create_draft_pr": true,
+                "base": "main",
+                "title": "Test PR"
+            }
+        },
+        "id": session.next_id()
+    });
+
+    let pr_response = session.send_request(push_with_pr_request)?;
+    let pr_result = &pr_response["result"];
+    let pr_is_error = pr_result
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+
+    // This should succeed due to backward compatibility (push_new_branch enables create_draft)
+    if pr_is_error {
+        let error_content = &pr_result["content"];
+        let error_text = error_content[0]["text"].as_str().unwrap_or("");
+        // Should NOT be a permission error due to backward compatibility
+        assert!(
+            !error_text.contains("create-draft permission not granted"),
+            "Expected no create-draft permission error due to backward compatibility, got: {}",
+            error_text
+        );
+    }
+
+    // Test gh_create_branch (should work - only needs push-new-branch)
+    let create_branch_request = json!({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "gh_create_branch",
+            "arguments": {
+                "repo": test_repo,
+                "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                "description": "test-branch"
+            }
+        },
+        "id": session.next_id()
+    });
+
+    let branch_response = session.send_request(create_branch_request)?;
+    let branch_result = &branch_response["result"];
+    let branch_is_error = branch_result
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+
+    if branch_is_error {
+        let error_content = &branch_result["content"];
+        let error_text = error_content[0]["text"].as_str().unwrap_or("");
+        // Should NOT be a permission error
+        assert!(
+            !error_text.contains("push-new-branch permission not granted"),
+            "Expected no permission error for gh_create_branch, got: {}",
+            error_text
+        );
+        // Should be a GitHub API error instead (branch creation failure)
+        assert!(
+            error_text.contains("Failed to create branch") || error_text.contains("API error"),
+            "Expected GitHub API error, got: {}",
+            error_text
+        );
+    }
+
+    Ok(())
+}
+integration_test!(test_mcp_permission_separation_push_new_branch_only);
+
+/// Test that tools fail correctly when they don't have the required permissions
+fn test_mcp_permission_separation_create_draft_only() -> Result<()> {
+    let test_repo = get_test_repo();
+
+    // Configure server with only create-draft permission (no push-new-branch)
+    let config = format!(
+        r#"
+[server]
+secret = "test-secret"
+admin-key = "admin-key"
+mode = "optional"
+
+[gh.repos]
+"{}" = {{ read = true, create-draft = true, push-new-branch = false }}
+"#,
+        test_repo
+    );
+
+    let server = McpServerHandle::start(&config)?;
+    let mut session = McpSession::new(&server.mcp_url());
+    let _ = session.initialize()?;
+    session.send_initialized()?;
+
+    // Test github_push without PR (should fail - needs push-new-branch)
+    let push_no_pr_request = json!({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "github_push",
+            "arguments": {
+                "repo_path": "/workspaces/test-repo",
+                "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                "repo": test_repo,
+                "description": "test-push",
+                "create_draft_pr": false
+            }
+        },
+        "id": session.next_id()
+    });
+
+    let push_response = session.send_request(push_no_pr_request)?;
+    let push_result = &push_response["result"];
+    let push_is_error = push_result
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+
+    assert!(
+        push_is_error,
+        "Expected push without PR to fail due to missing push-new-branch permission"
+    );
+
+    let error_content = &push_result["content"];
+    let error_text = error_content[0]["text"].as_str().unwrap_or("");
+    assert!(
+        error_text.contains("push-new-branch permission not granted"),
+        "Expected push-new-branch permission error, got: {}",
+        error_text
+    );
+
+    // Test github_push with PR (should also fail - needs both permissions)
+    let push_with_pr_request = json!({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "github_push",
+            "arguments": {
+                "repo_path": "/workspaces/test-repo",
+                "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                "repo": test_repo,
+                "description": "test-push",
+                "create_draft_pr": true,
+                "base": "main",
+                "title": "Test PR"
+            }
+        },
+        "id": session.next_id()
+    });
+
+    let pr_response = session.send_request(push_with_pr_request)?;
+    let pr_result = &pr_response["result"];
+    let pr_is_error = pr_result
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+
+    assert!(
+        pr_is_error,
+        "Expected push with PR to fail due to missing push-new-branch permission"
+    );
+
+    let pr_error_content = &pr_result["content"];
+    let pr_error_text = pr_error_content[0]["text"].as_str().unwrap_or("");
+    assert!(
+        pr_error_text.contains("push-new-branch permission not granted"),
+        "Expected push-new-branch permission error for PR creation too, got: {}",
+        pr_error_text
+    );
+
+    // Test gh_create_branch (should fail - needs push-new-branch)
+    let create_branch_request = json!({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "gh_create_branch",
+            "arguments": {
+                "repo": test_repo,
+                "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                "description": "test-branch"
+            }
+        },
+        "id": session.next_id()
+    });
+
+    let branch_response = session.send_request(create_branch_request)?;
+    let branch_result = &branch_response["result"];
+    let branch_is_error = branch_result
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+
+    assert!(
+        branch_is_error,
+        "Expected branch creation to fail due to missing push-new-branch permission"
+    );
+
+    let branch_error_content = &branch_result["content"];
+    let branch_error_text = branch_error_content[0]["text"].as_str().unwrap_or("");
+    assert!(
+        branch_error_text.contains("push-new-branch permission not granted"),
+        "Expected push-new-branch permission error for branch creation, got: {}",
+        branch_error_text
+    );
+
+    Ok(())
+}
+integration_test!(test_mcp_permission_separation_create_draft_only);
+
+/// Test that tools work correctly when they have both permissions
+fn test_mcp_permission_separation_both_permissions() -> Result<()> {
+    let test_repo = get_test_repo();
+
+    // Configure server with both push-branch and create-draft permissions
+    let config = format!(
+        r#"
+[server]
+secret = "test-secret"
+admin-key = "admin-key"
+mode = "optional"
+
+[gh.repos]
+"{}" = {{ read = true, create-draft = true, push-branch = true }}
+"#,
+        test_repo
+    );
+
+    let server = McpServerHandle::start(&config)?;
+    let mut session = McpSession::new(&server.mcp_url());
+    let _ = session.initialize()?;
+    session.send_initialized()?;
+
+    // All operations should work from a permission perspective
+    // (they may fail due to missing git repos or GitHub API issues, but not permissions)
+
+    // Test github_push without PR
+    let push_no_pr_request = json!({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "github_push",
+            "arguments": {
+                "repo_path": "/workspaces/test-repo",
+                "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                "repo": test_repo,
+                "description": "test-push",
+                "create_draft_pr": false
+            }
+        },
+        "id": session.next_id()
+    });
+
+    let push_response = session.send_request(push_no_pr_request)?;
+    let push_result = &push_response["result"];
+
+    if let Some(true) = push_result.get("isError").and_then(|e| e.as_bool()) {
+        let error_content = &push_result["content"];
+        let error_text = error_content[0]["text"].as_str().unwrap_or("");
+        // Should NOT be a permission error
+        assert!(
+            !error_text.contains("permission not granted"),
+            "Expected no permission error with both permissions, got: {}",
+            error_text
+        );
+    }
+
+    // Test github_push with PR
+    let push_with_pr_request = json!({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "github_push",
+            "arguments": {
+                "repo_path": "/workspaces/test-repo",
+                "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                "repo": test_repo,
+                "description": "test-push",
+                "create_draft_pr": true,
+                "base": "main",
+                "title": "Test PR"
+            }
+        },
+        "id": session.next_id()
+    });
+
+    let pr_response = session.send_request(push_with_pr_request)?;
+    let pr_result = &pr_response["result"];
+
+    if let Some(true) = pr_result.get("isError").and_then(|e| e.as_bool()) {
+        let error_content = &pr_result["content"];
+        let error_text = error_content[0]["text"].as_str().unwrap_or("");
+        // Should NOT be a permission error
+        assert!(
+            !error_text.contains("permission not granted"),
+            "Expected no permission error for PR creation with both permissions, got: {}",
+            error_text
+        );
+    }
+
+    // Test gh_create_branch
+    let create_branch_request = json!({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "gh_create_branch",
+            "arguments": {
+                "repo": test_repo,
+                "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                "description": "test-branch"
+            }
+        },
+        "id": session.next_id()
+    });
+
+    let branch_response = session.send_request(create_branch_request)?;
+    let branch_result = &branch_response["result"];
+
+    if let Some(true) = branch_result.get("isError").and_then(|e| e.as_bool()) {
+        let error_content = &branch_result["content"];
+        let error_text = error_content[0]["text"].as_str().unwrap_or("");
+        // Should NOT be a permission error
+        assert!(
+            !error_text.contains("permission not granted"),
+            "Expected no permission error for branch creation with both permissions, got: {}",
+            error_text
+        );
+    }
+
+    Ok(())
+}
+integration_test!(test_mcp_permission_separation_both_permissions);
+
+/// Test that tools fail correctly when they have no relevant permissions
+fn test_mcp_permission_separation_no_permissions() -> Result<()> {
+    let test_repo = get_test_repo();
+
+    // Configure server with only read permission (no push-branch or create-draft)
+    let config = format!(
+        r#"
+[server]
+secret = "test-secret"
+admin-key = "admin-key"
+mode = "optional"
+
+[gh.repos]
+"{}" = {{ read = true, create-draft = false, push-branch = false }}
+"#,
+        test_repo
+    );
+
+    let server = McpServerHandle::start(&config)?;
+    let mut session = McpSession::new(&server.mcp_url());
+    let _ = session.initialize()?;
+    session.send_initialized()?;
+
+    // All write operations should fail
+
+    // Test github_push without PR (should fail - needs push-new-branch)
+    let push_no_pr_request = json!({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "github_push",
+            "arguments": {
+                "repo_path": "/workspaces/test-repo",
+                "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                "repo": test_repo,
+                "description": "test-push",
+                "create_draft_pr": false
+            }
+        },
+        "id": session.next_id()
+    });
+
+    let push_response = session.send_request(push_no_pr_request)?;
+    let push_result = &push_response["result"];
+    let push_is_error = push_result
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+
+    assert!(
+        push_is_error,
+        "Expected push without PR to fail due to missing permissions"
+    );
+
+    let error_content = &push_result["content"];
+    let error_text = error_content[0]["text"].as_str().unwrap_or("");
+    assert!(
+        error_text.contains("push-new-branch permission not granted"),
+        "Expected push-new-branch permission error, got: {}",
+        error_text
+    );
+
+    // Test github_push with PR (should also fail - needs both permissions)
+    let push_with_pr_request = json!({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "github_push",
+            "arguments": {
+                "repo_path": "/workspaces/test-repo",
+                "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                "repo": test_repo,
+                "description": "test-push",
+                "create_draft_pr": true,
+                "base": "main",
+                "title": "Test PR"
+            }
+        },
+        "id": session.next_id()
+    });
+
+    let pr_response = session.send_request(push_with_pr_request)?;
+    let pr_result = &pr_response["result"];
+    let pr_is_error = pr_result
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+
+    assert!(
+        pr_is_error,
+        "Expected push with PR to fail due to missing permissions"
+    );
+
+    let pr_error_content = &pr_result["content"];
+    let pr_error_text = pr_error_content[0]["text"].as_str().unwrap_or("");
+    assert!(
+        pr_error_text.contains("push-new-branch permission not granted"),
+        "Expected push-new-branch permission error for PR creation, got: {}",
+        pr_error_text
+    );
+
+    // Test gh_create_branch (should fail - needs push-new-branch)
+    let create_branch_request = json!({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "gh_create_branch",
+            "arguments": {
+                "repo": test_repo,
+                "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                "description": "test-branch"
+            }
+        },
+        "id": session.next_id()
+    });
+
+    let branch_response = session.send_request(create_branch_request)?;
+    let branch_result = &branch_response["result"];
+    let branch_is_error = branch_result
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+
+    assert!(
+        branch_is_error,
+        "Expected branch creation to fail due to missing permissions"
+    );
+
+    let branch_error_content = &branch_result["content"];
+    let branch_error_text = branch_error_content[0]["text"].as_str().unwrap_or("");
+    assert!(
+        branch_error_text.contains("push-new-branch permission not granted"),
+        "Expected push-new-branch permission error for branch creation, got: {}",
+        branch_error_text
+    );
+
+    Ok(())
+}
+integration_test!(test_mcp_permission_separation_no_permissions);
+
+/// Test backward compatibility - existing configs with create-draft should still work
+fn test_mcp_permission_separation_backward_compatibility() -> Result<()> {
+    let test_repo = get_test_repo();
+
+    // Configure server with legacy-style permissions (create-draft = true, no push-branch specified)
+    // This simulates an existing configuration before the push-branch separation
+    let config = format!(
+        r#"
+[server]
+secret = "test-secret"
+admin-key = "admin-key"
+mode = "optional"
+
+[gh.repos]
+"{}" = {{ read = true, create-draft = true, pending-review = true }}
+"#,
+        test_repo
+    );
+
+    let server = McpServerHandle::start(&config)?;
+    let mut session = McpSession::new(&server.mcp_url());
+    let _ = session.initialize()?;
+    session.send_initialized()?;
+
+    // Test that github_push with create_draft_pr works (backward compatibility)
+    let push_with_pr_request = json!({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "github_push",
+            "arguments": {
+                "repo_path": "/workspaces/test-repo",
+                "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                "repo": test_repo,
+                "description": "test-push",
+                "create_draft_pr": true,
+                "base": "main",
+                "title": "Test PR"
+            }
+        },
+        "id": session.next_id()
+    });
+
+    let pr_response = session.send_request(push_with_pr_request)?;
+    let pr_result = &pr_response["result"];
+
+    if let Some(true) = pr_result.get("isError").and_then(|e| e.as_bool()) {
+        let error_content = &pr_result["content"];
+        let error_text = error_content[0]["text"].as_str().unwrap_or("");
+        // Should NOT be a permission error - legacy configs should work
+        assert!(
+            !error_text.contains("permission not granted"),
+            "Expected no permission error for legacy config, got: {}",
+            error_text
+        );
+    }
+
+    // However, direct push without PR should fail since push-branch defaults to false
+    let push_no_pr_request = json!({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "github_push",
+            "arguments": {
+                "repo_path": "/workspaces/test-repo",
+                "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                "repo": test_repo,
+                "description": "test-push",
+                "create_draft_pr": false
+            }
+        },
+        "id": session.next_id()
+    });
+
+    let push_response = session.send_request(push_no_pr_request)?;
+    let push_result = &push_response["result"];
+    let push_is_error = push_result
+        .get("isError")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
+
+    assert!(
+        push_is_error,
+        "Expected push without PR to fail due to missing push-new-branch permission in legacy config"
+    );
+
+    let error_content = &push_result["content"];
+    let error_text = error_content[0]["text"].as_str().unwrap_or("");
+    assert!(
+        error_text.contains("push-new-branch permission not granted"),
+        "Expected push-new-branch permission error for legacy config without explicit push-new-branch, got: {}",
+        error_text
+    );
+
+    Ok(())
+}
+integration_test!(test_mcp_permission_separation_backward_compatibility);

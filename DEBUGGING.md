@@ -9,7 +9,7 @@ Start the server:
 # Build first
 cargo build --release
 
-# Start with a test repo (read-only access to a playground repo)
+# Start with a test repo (read and create-draft access to a playground repo)
 ./target/release/service-gator --mcp-server 127.0.0.1:29765 --gh-repo cgwalters/playground:read,create-draft
 ```
 
@@ -71,7 +71,7 @@ For debugging the actual JSON-RPC messages:
 
 ```bash
 # Run with RUST_LOG for debug output
-RUST_LOG=rmcp=debug,service_gator=debug ./target/release/service-gator --mcp-server 127.0.0.1:29765 --gh-repo cgwalters/playground:read
+RUST_LOG=rmcp=debug,service_gator=debug ./target/release/service-gator --mcp-server 127.0.0.1:29765 --gh-repo cgwalters/playground:read,create-draft
 ```
 
 ### 5. Testing with curl
