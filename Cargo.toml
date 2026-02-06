@@ -55,6 +55,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 itertools = "0.14"
 camino = { version = "1.2.2", features = ["serde1"] }
 tempfile = "3.24.0"
+# Pin time to avoid 0.3.47 which has compile-time assertions that fail on older Rust
+# See: https://github.com/time-rs/time/issues/836
+time = ">=0.3,<0.3.47"
 
 [dev-dependencies]
 itertools = "0.14"
