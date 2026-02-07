@@ -410,15 +410,35 @@ impl ServiceRegistry {
         }
     }
 
-    /// Get the appropriate service for an API path.
-    pub fn get_service(&self, api_path: &str) -> Option<&ApiService> {
-        match api_path {
-            path if path.starts_with("/api/v3") => Some(&self.github),
-            path if path.starts_with("/api/v4") => Some(&self.gitlab),
-            path if path.starts_with("/api/v1") => Some(&self.forgejo),
-            path if path.starts_with("/rest/api/") => Some(&self.jira),
-            _ => None,
+    /// Get the appropriate service for an API path with service-aware routing.
+    pub fn get_service(&self, api_path: &str) -> Option<(&ApiService, &'static str)> {
+        // GitHub uses /api/v3 prefix
+        if api_path.starts_with("/api/v3") {
+            Some((&self.github, "/api/v3/"))
         }
+        // GitLab uses /api/v4 prefix
+        else if api_path.starts_with("/api/v4") {
+            Some((&self.gitlab, "/api/v4/"))
+        }
+        // Forgejo/Gitea uses /api/v1 prefix
+        else if api_path.starts_with("/api/v1") {
+            Some((&self.forgejo, "/api/v1/"))
+        }
+        // JIRA uses /rest/api/2/ or /rest/api/ prefix
+        else if api_path.starts_with("/rest/api/2/") {
+            Some((&self.jira, "/rest/api/2/"))
+        }
+        else if api_path.starts_with("/rest/api/") {
+            Some((&self.jira, "/rest/api/"))
+        }
+        else {
+            None
+        }
+    }
+
+    /// Get the appropriate service for an API path (legacy method for compatibility).
+    pub fn get_service_legacy(&self, api_path: &str) -> Option<&ApiService> {
+        self.get_service(api_path).map(|(service, _)| service)
     }
 
     /// Get service by name.
@@ -623,52 +643,73 @@ mod tests {
     fn test_service_registry_get_service_github() {
         let registry = ServiceRegistry::new();
 
-        let service = registry.get_service("/api/v3/repos/owner/repo");
+        let result = registry.get_service("/api/v3/repos/owner/repo");
         assert!(
-            service.is_some(),
+            result.is_some(),
             "Expected GitHub service for /api/v3 path"
         );
+        let (_, prefix) = result.unwrap();
+        assert_eq!(prefix, "/api/v3/", "Expected GitHub API prefix");
     }
 
     #[test]
     fn test_service_registry_get_service_gitlab() {
         let registry = ServiceRegistry::new();
 
-        let service = registry.get_service("/api/v4/projects/123");
+        let result = registry.get_service("/api/v4/projects/123");
         assert!(
-            service.is_some(),
+            result.is_some(),
             "Expected GitLab service for /api/v4 path"
         );
+        let (_, prefix) = result.unwrap();
+        assert_eq!(prefix, "/api/v4/", "Expected GitLab API prefix");
     }
 
     #[test]
     fn test_service_registry_get_service_forgejo() {
         let registry = ServiceRegistry::new();
 
-        let service = registry.get_service("/api/v1/repos/owner/repo");
+        let result = registry.get_service("/api/v1/repos/owner/repo");
         assert!(
-            service.is_some(),
+            result.is_some(),
             "Expected Forgejo service for /api/v1 path"
         );
+        let (_, prefix) = result.unwrap();
+        assert_eq!(prefix, "/api/v1/", "Expected Forgejo API prefix");
     }
 
     #[test]
     fn test_service_registry_get_service_jira() {
         let registry = ServiceRegistry::new();
 
-        let service = registry.get_service("/rest/api/2/issue/PROJ-123");
+        let result = registry.get_service("/rest/api/2/issue/PROJ-123");
         assert!(
-            service.is_some(),
+            result.is_some(),
+            "Expected JIRA service for /rest/api/2 path"
+        );
+        let (_, prefix) = result.unwrap();
+        assert_eq!(prefix, "/rest/api/2/", "Expected JIRA API v2 prefix");
+    }
+
+    #[test]
+    fn test_service_registry_get_service_jira_legacy() {
+        let registry = ServiceRegistry::new();
+
+        let result = registry.get_service("/rest/api/issue/PROJ-123");
+        assert!(
+            result.is_some(),
             "Expected JIRA service for /rest/api path"
         );
+        let (_, prefix) = result.unwrap();
+        assert_eq!(prefix, "/rest/api/", "Expected JIRA API legacy prefix");
     }
 
     #[test]
     fn test_service_registry_get_service_unknown() {
         let registry = ServiceRegistry::new();
 
-        let service = registry.get_service("/unknown/path");
-        assert!(service.is_none(), "Expected None for unknown path");
+        let result = registry.get_service("/unknown/path");
+        assert!(result.is_none(), "Expected None for unknown path");
     }
 
     #[test]

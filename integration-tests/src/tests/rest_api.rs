@@ -233,8 +233,17 @@ fn get_denied_repo() -> String {
 // Basic REST Server Tests
 // ============================================================================
 
-/// Test that the REST server starts and responds to /health
-fn test_rest_server_health_endpoint() -> Result<()> {
+/// Test data structure for basic server endpoints
+struct BasicEndpointTestCase {
+    name: &'static str,
+    path: &'static str,
+    expected_status: u16,
+    expected_content_check: fn(&str) -> bool,
+    is_json: bool,
+}
+
+/// Test that basic REST server endpoints work correctly
+fn test_rest_server_basic_endpoints() -> Result<()> {
     let config = r#"
 [gh.repos]
 "test/repo" = { read = true }
@@ -243,83 +252,90 @@ fn test_rest_server_health_endpoint() -> Result<()> {
     let server = RestServerHandle::start(config)?;
     let client = RestClient::new(server.base_url());
 
-    let (status, body) = client.get("/health")?;
+    let test_cases = vec![
+        BasicEndpointTestCase {
+            name: "health endpoint",
+            path: "/health",
+            expected_status: 200,
+            expected_content_check: |body| body == "OK",
+            is_json: false,
+        },
+        BasicEndpointTestCase {
+            name: "root endpoint",
+            path: "/",
+            expected_status: 200,
+            expected_content_check: |body| body.contains("service-gator"),
+            is_json: false,
+        },
+        BasicEndpointTestCase {
+            name: "status endpoint",
+            path: "/status",
+            expected_status: 200,
+            expected_content_check: |_| true, // Will check JSON structure separately
+            is_json: true,
+        },
+    ];
 
-    assert_eq!(status, 200, "Health endpoint should return 200");
-    assert_eq!(body, "OK", "Health endpoint should return 'OK'");
+    for test_case in test_cases {
+        if test_case.is_json {
+            let (status, json) = client.get_json(test_case.path)?;
+            assert_eq!(
+                status, test_case.expected_status,
+                "{} should return {}",
+                test_case.name, test_case.expected_status
+            );
+
+            if test_case.path == "/status" {
+                // Specific checks for status endpoint
+                assert_eq!(json["status"], "running", "Status should be 'running'");
+
+                // Verify services are listed
+                assert!(
+                    json["services"]["github"].is_string(),
+                    "Should list GitHub service"
+                );
+                assert!(
+                    json["services"]["gitlab"].is_string(),
+                    "Should list GitLab service"
+                );
+                assert!(
+                    json["services"]["forgejo"].is_string(),
+                    "Should list Forgejo service"
+                );
+                assert!(
+                    json["services"]["jira"].is_string(),
+                    "Should list JIRA service"
+                );
+
+                // Verify endpoints are listed
+                assert!(
+                    json["endpoints"]["github"].is_string(),
+                    "Should list GitHub endpoint"
+                );
+                assert!(
+                    json["endpoints"]["gitlab"].is_string(),
+                    "Should list GitLab endpoint"
+                );
+            }
+        } else {
+            let (status, body) = client.get(test_case.path)?;
+            assert_eq!(
+                status, test_case.expected_status,
+                "{} should return {}",
+                test_case.name, test_case.expected_status
+            );
+            assert!(
+                (test_case.expected_content_check)(&body),
+                "{} content check failed: {}",
+                test_case.name,
+                body
+            );
+        }
+    }
 
     Ok(())
 }
-integration_test!(test_rest_server_health_endpoint);
-
-/// Test that the REST server status endpoint returns correct info
-fn test_rest_server_status_endpoint() -> Result<()> {
-    let config = r#"
-[gh.repos]
-"test/repo" = { read = true }
-"#;
-
-    let server = RestServerHandle::start(config)?;
-    let client = RestClient::new(server.base_url());
-
-    let (status, json) = client.get_json("/status")?;
-
-    assert_eq!(status, 200, "Status endpoint should return 200");
-    assert_eq!(json["status"], "running", "Status should be 'running'");
-
-    // Verify services are listed
-    assert!(
-        json["services"]["github"].is_string(),
-        "Should list GitHub service"
-    );
-    assert!(
-        json["services"]["gitlab"].is_string(),
-        "Should list GitLab service"
-    );
-    assert!(
-        json["services"]["forgejo"].is_string(),
-        "Should list Forgejo service"
-    );
-    assert!(
-        json["services"]["jira"].is_string(),
-        "Should list JIRA service"
-    );
-
-    // Verify endpoints are listed
-    assert!(
-        json["endpoints"]["github"].is_string(),
-        "Should list GitHub endpoint"
-    );
-    assert!(
-        json["endpoints"]["gitlab"].is_string(),
-        "Should list GitLab endpoint"
-    );
-
-    Ok(())
-}
-integration_test!(test_rest_server_status_endpoint);
-
-/// Test that the root endpoint returns a welcome message
-fn test_rest_server_root_endpoint() -> Result<()> {
-    let config = r#"
-[gh.repos]
-"test/repo" = { read = true }
-"#;
-
-    let server = RestServerHandle::start(config)?;
-    let client = RestClient::new(server.base_url());
-
-    let (status, body) = client.get("/")?;
-
-    assert_eq!(status, 200, "Root endpoint should return 200");
-    assert!(
-        body.contains("service-gator"),
-        "Root should mention service-gator"
-    );
-
-    Ok(())
-}
-integration_test!(test_rest_server_root_endpoint);
+integration_test!(test_rest_server_basic_endpoints);
 
 // ============================================================================
 // GitHub API Proxy Tests
@@ -673,130 +689,128 @@ integration_test!(test_rest_github_api_forwarding);
 // Permission Validation Tests
 // ============================================================================
 
-/// Test that read operations require read permission
-fn test_rest_permission_read_required() -> Result<()> {
-    // Configure a repo with NO read permission (only create-draft)
+/// Test data structure for permission validation tests
+struct PermissionTestCase {
+    name: &'static str,
+    config_template: &'static str,
+    request_method: &'static str,
+    request_path: &'static str,
+    request_body: Option<Value>,
+    expected_result: PermissionTestResult,
+}
+
+enum PermissionTestResult {
+    /// Should be allowed (200, 401, etc. but not permission denied)
+    Allowed,
+    /// Should be denied (400/403 with permission error)
+    Denied,
+    /// Should not have permission error in response
+    NoPermissionError,
+}
+
+/// Test permission validation using table-driven approach
+fn test_rest_permission_validation() -> Result<()> {
     let test_repo = get_test_repo();
-    let config = format!(
-        r#"
+
+    let test_cases = vec![
+        PermissionTestCase {
+            name: "read operation with create-draft permission",
+            config_template: r#"
 [gh.repos]
 "{}" = {{ read = false, create-draft = true }}
 "#,
-        test_repo
-    );
-
-    let server = RestServerHandle::start(&config)?;
-    let client = RestClient::new(server.base_url());
-
-    let path = format!("/api/v3/repos/{}", test_repo);
-    let (status, body) = client.get(&path)?;
-
-    // create-draft implies read access for backward compatibility
-    // Permission check should pass, though the CLI may fail due to auth
-    // Status codes:
-    // - 200: Success (if GH_TOKEN is set and valid)
-    // - 400: CLI auth error (no GH_TOKEN) - still indicates permission check passed
-    // - 401: GitHub auth required
-    // We should NOT get a permission denied error in the body
-    assert!(
-        status == 200 || status == 400 || status == 401,
-        "Unexpected status {}: {}",
-        status,
-        body
-    );
-
-    // If we get 400, it should be a CLI auth error, not a permission error
-    if status == 400 && body.contains("not allowed") {
-        panic!(
-            "Got permission denied with create-draft permission: {}",
-            body
-        );
-    }
-
-    Ok(())
-}
-integration_test!(test_rest_permission_read_required);
-
-/// Test that write operations require write permission
-fn test_rest_permission_write_required() -> Result<()> {
-    let test_repo = get_test_repo();
-
-    // Read-only permission
-    let config = format!(
-        r#"
+            request_method: "GET",
+            request_path: "/api/v3/repos/{}",
+            request_body: None,
+            expected_result: PermissionTestResult::Allowed, // create-draft implies read
+        },
+        PermissionTestCase {
+            name: "write operation without write permission",
+            config_template: r#"
 [gh.repos]
 "{}" = {{ read = true, write = false }}
 "#,
-        test_repo
-    );
-
-    let server = RestServerHandle::start(&config)?;
-    let client = RestClient::new(server.base_url());
-
-    // Try a write operation (POST)
-    let path = format!("/api/v3/repos/{}/issues", test_repo);
-    let body = json!({
-        "title": "Test",
-        "body": "Should fail"
-    });
-
-    let (status, response_body) = client.post_json(&path, &body)?;
-
-    assert!(
-        status == 400 || status == 403,
-        "Expected write to be denied without permission, got {}: {}",
-        status,
-        response_body
-    );
-
-    Ok(())
-}
-integration_test!(test_rest_permission_write_required);
-
-/// Test that write operations work with write permission
-fn test_rest_permission_write_allowed() -> Result<()> {
-    let test_repo = get_test_repo();
-
-    // Full write permission
-    let config = format!(
-        r#"
+            request_method: "POST",
+            request_path: "/api/v3/repos/{}/issues",
+            request_body: Some(json!({"title": "Test", "body": "Should fail"})),
+            expected_result: PermissionTestResult::Denied,
+        },
+        PermissionTestCase {
+            name: "write operation with write permission",
+            config_template: r#"
 [gh.repos]
 "{}" = {{ read = true, write = true }}
 "#,
-        test_repo
-    );
+            request_method: "POST",
+            request_path: "/api/v3/repos/{}/issues",
+            request_body: Some(json!({"title": "Test", "body": "Permission check"})),
+            expected_result: PermissionTestResult::NoPermissionError,
+        },
+    ];
 
-    let server = RestServerHandle::start(&config)?;
-    let client = RestClient::new(server.base_url());
+    for test_case in test_cases {
+        let config = test_case.config_template.replace("{}", &test_repo);
+        let server = RestServerHandle::start(&config)?;
+        let client = RestClient::new(server.base_url());
 
-    // With write permission, the request should pass permission checks
-    // It may still fail due to GitHub auth or rate limits, but not permission
-    let path = format!("/api/v3/repos/{}/issues", test_repo);
-    let body = json!({
-        "title": "Test",
-        "body": "Permission check"
-    });
+        let path = test_case.request_path.replace("{}", &test_repo);
 
-    let (status, response_body) = client.post_json(&path, &body)?;
+        let (status, body) = match test_case.request_method {
+            "GET" => client.get(&path)?,
+            "POST" => {
+                if let Some(body_json) = test_case.request_body {
+                    client.post_json(&path, &body_json)?
+                } else {
+                    return Err(eyre::eyre!("POST request requires body"));
+                }
+            }
+            method => return Err(eyre::eyre!("Unsupported method: {}", method)),
+        };
 
-    // Should NOT be a permission error
-    // Could be 401 (no token), 403 (GitHub rate limit), 422 (validation), etc.
-    // But 400 with "not allowed" would indicate permission check failed
-    if status == 400 {
-        assert!(
-            !response_body.contains("Write access not allowed"),
-            "Should not get permission error with write permission: {}",
-            response_body
-        );
+        match test_case.expected_result {
+            PermissionTestResult::Allowed => {
+                assert!(
+                    status == 200 || status == 400 || status == 401,
+                    "{}: unexpected status {}: {}",
+                    test_case.name,
+                    status,
+                    body
+                );
+                if status == 400 && body.contains("not allowed") {
+                    panic!(
+                        "{}: got permission denied when should be allowed: {}",
+                        test_case.name, body
+                    );
+                }
+            }
+            PermissionTestResult::Denied => {
+                assert!(
+                    status == 400 || status == 403,
+                    "{}: expected permission denied, got {}: {}",
+                    test_case.name,
+                    status,
+                    body
+                );
+            }
+            PermissionTestResult::NoPermissionError => {
+                if status == 400 {
+                    assert!(
+                        !body.contains("Write access not allowed"),
+                        "{}: should not get permission error: {}",
+                        test_case.name,
+                        body
+                    );
+                }
+            }
+        }
     }
 
     Ok(())
 }
-integration_test!(test_rest_permission_write_allowed);
+integration_test!(test_rest_permission_validation);
 
 /// Test global read access enforcement
 fn test_rest_global_read_access() -> Result<()> {
-    // Enable global read
     let config = r#"
 [gh]
 read = true
@@ -805,29 +819,19 @@ read = true
     let server = RestServerHandle::start(config)?;
     let client = RestClient::new(server.base_url());
 
-    // With global read, any repo should be readable
-    let (status, body) = client.get("/api/v3/repos/octocat/Hello-World")?;
+    // Test cases for global read access
+    let paths = vec!["/api/v3/repos/octocat/Hello-World", "/api/v3/user"];
 
-    // Permission check should pass, though the CLI may fail due to auth
-    // Status codes:
-    // - 200: Success (if GH_TOKEN is set and valid)
-    // - 400: CLI auth error (no GH_TOKEN) - still indicates permission check passed
-    // - 401: GitHub auth required
-    // - 403: Rate limited or GitHub permission denied
-    // We should NOT get a "not allowed" permission error
-    if status == 400 && body.contains("not allowed") {
-        panic!("Got permission denied with global read: {}", body);
-    }
+    for path in paths {
+        let (status, body) = client.get(path)?;
 
-    // Non-repo endpoints should also work
-    let (user_status, user_body) = client.get("/api/v3/user")?;
-
-    // Permission check should pass (may fail due to CLI auth)
-    if user_status == 400 && user_body.contains("not allowed") {
-        panic!(
-            "Got permission denied for user endpoint with global read: {}",
-            user_body
-        );
+        // Permission check should pass, though the CLI may fail due to auth
+        if status == 400 && body.contains("not allowed") {
+            panic!(
+                "Got permission denied with global read for {}: {}",
+                path, body
+            );
+        }
     }
 
     Ok(())

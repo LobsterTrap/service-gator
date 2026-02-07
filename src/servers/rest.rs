@@ -135,9 +135,9 @@ async fn generic_api_handler(
         None
     };
 
-    // Get service for this path
-    let service = match state.service_registry.get_service(path) {
-        Some(s) => s,
+    // Get service for this path with service-aware routing
+    let (service, service_prefix) = match state.service_registry.get_service(path) {
+        Some((s, prefix)) => (s, prefix),
         None => {
             return api_error_response(
                 StatusCode::NOT_FOUND,
@@ -146,14 +146,8 @@ async fn generic_api_handler(
         }
     };
 
-    // Extract endpoint (remove API prefix)
-    let endpoint = path
-        .strip_prefix("/api/v3/")
-        .or_else(|| path.strip_prefix("/api/v4/"))
-        .or_else(|| path.strip_prefix("/api/v1/"))
-        .or_else(|| path.strip_prefix("/rest/api/2/"))
-        .or_else(|| path.strip_prefix("/rest/api/"))
-        .unwrap_or(path);
+    // Extract endpoint using the service-specific prefix
+    let endpoint = path.strip_prefix(service_prefix).unwrap_or(path);
 
     // Extract jq parameter
     let jq = params.get("jq").map(|s| s.as_str());
