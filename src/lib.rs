@@ -46,6 +46,7 @@
 //! ```
 
 pub mod auth;
+pub mod config_watcher;
 pub mod core;
 pub mod forgejo;
 pub mod forgejo_client;
