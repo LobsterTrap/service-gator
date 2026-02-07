@@ -45,6 +45,7 @@ use crate::auth::{
     AuthError, AuthMode, MintError, MintRequest, RotateError, RotateRequest, ServerConfig,
     TokenAuthority, TokenError,
 };
+use tokio::sync::watch;
 
 /// Constant-time byte comparison to prevent timing attacks.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -2736,8 +2737,10 @@ fn find_forgejo_scope<'a>(
 pub struct AppState {
     /// Token authority for signing/validating JWTs.
     pub token_authority: Option<Arc<TokenAuthority>>,
-    /// Server configuration.
-    pub config: Arc<ServerConfig>,
+    /// Server authentication configuration (mode, rotation, etc.).
+    pub server_config: Arc<ServerConfig>,
+    /// Scopes configuration receiver (updated by file watcher if enabled).
+    pub scopes: watch::Receiver<ScopeConfig>,
 }
 
 /// Start the MCP server on the given address.
@@ -2750,6 +2753,19 @@ pub async fn start_server(bind_addr: &str, config: ScopeConfig) -> Result<()> {
 
 /// Start the MCP server with full configuration including auth.
 pub async fn start_server_with_config(bind_addr: &str, config: ServerConfig) -> Result<()> {
+    let scopes = crate::config_watcher::static_scopes(config.scopes.clone());
+    start_mcp_server(bind_addr, config, scopes).await
+}
+
+/// Start the MCP server with scopes configuration.
+///
+/// The `scopes` receiver provides access to scope configuration,
+/// and may be updated by a file watcher for live reload.
+pub async fn start_mcp_server(
+    bind_addr: &str,
+    config: ServerConfig,
+    scopes: watch::Receiver<ScopeConfig>,
+) -> Result<()> {
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     };
@@ -2791,7 +2807,8 @@ pub async fn start_server_with_config(bind_addr: &str, config: ServerConfig) -> 
 
     let app_state = AppState {
         token_authority,
-        config: Arc::new(config),
+        server_config: Arc::new(config),
+        scopes,
     };
 
     // Build the MCP service route with auth middleware
@@ -2804,9 +2821,10 @@ pub async fn start_server_with_config(bind_addr: &str, config: ServerConfig) -> 
         ))
         .with_state(app_state.clone());
 
-    // Build the router with auth endpoints and MCP service
+    // Build the router with auth endpoints, health check, and MCP service
     // Note: /admin/mint-token and /token/rotate have their own auth logic
     let router = axum::Router::new()
+        .route("/healthz", axum::routing::get(health_handler))
         .route("/admin/mint-token", axum::routing::post(mint_token_handler))
         .route("/token/rotate", axum::routing::post(rotate_token_handler))
         .merge(mcp_router)
@@ -2818,7 +2836,7 @@ pub async fn start_server_with_config(bind_addr: &str, config: ServerConfig) -> 
 
     axum::serve(tcp_listener, router)
         .with_graceful_shutdown(async move {
-            tokio::signal::ctrl_c().await.ok();
+            shutdown_signal().await;
             tracing::info!("Shutting down MCP server");
             ct.cancel();
             // Signal the logging task to flush and stop
@@ -2827,6 +2845,38 @@ pub async fn start_server_with_config(bind_addr: &str, config: ServerConfig) -> 
         .await?;
 
     Ok(())
+}
+
+/// Wait for shutdown signal (SIGTERM or SIGINT/ctrl-c).
+///
+/// In Kubernetes, pods receive SIGTERM for graceful shutdown.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
+/// Health check endpoint for Kubernetes liveness/readiness probes.
+async fn health_handler() -> impl IntoResponse {
+    StatusCode::OK
 }
 
 /// Handler for POST /admin/mint-token
@@ -2848,7 +2898,7 @@ async fn mint_token_handler(
     };
 
     // Validate admin key
-    let expected_admin_key = match state.config.effective_admin_key() {
+    let expected_admin_key = match state.server_config.effective_admin_key() {
         Some(k) => k,
         None => {
             return (
@@ -2877,7 +2927,7 @@ async fn mint_token_handler(
     }
 
     // Mint the token
-    match authority.mint(&req, &state.config.server.rotation) {
+    match authority.mint(&req, &state.server_config.server.rotation) {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(MintError::ExpiresTooShort { min }) => (
             StatusCode::BAD_REQUEST,
@@ -2991,6 +3041,11 @@ fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
         .and_then(|v| v.strip_prefix("Bearer "))
 }
 
+/// Get the current scopes snapshot.
+fn get_scopes_snapshot(state: &AppState) -> ScopeConfig {
+    state.scopes.borrow().clone()
+}
+
 /// Middleware that validates JWT tokens and injects resolved scopes into request extensions.
 ///
 /// This middleware handles the three AuthMode variants:
@@ -2998,19 +3053,21 @@ fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
 /// - `Optional`: Validates tokens if present, uses fallback scopes for unauthenticated requests
 /// - `None`: Uses fallback scopes for all requests (no auth)
 ///
+/// When dynamic scopes are configured (via --scope-file), they are merged with the
+/// static scopes for each request, enabling live reload of permissions.
+///
 /// On success, injects `ResolvedScopes` into the request extensions for handlers to use.
 async fn auth_middleware(
     State(state): State<AppState>,
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
-    let mode = state.config.server.mode;
-    let fallback_scopes = &state.config.scopes;
+    let mode = state.server_config.server.mode;
 
-    // For AuthMode::None, use fallback scopes directly
+    // For AuthMode::None, use fallback scopes directly (with dynamic merge)
     if mode == AuthMode::None {
-        req.extensions_mut()
-            .insert(ResolvedScopes(fallback_scopes.clone()));
+        let fallback_scopes = get_scopes_snapshot(&state);
+        req.extensions_mut().insert(ResolvedScopes(fallback_scopes));
         return next.run(req).await;
     }
 
@@ -3056,8 +3113,8 @@ async fn auth_middleware(
         },
         // No token but mode is Optional - use fallback scopes
         (None, _) if mode == AuthMode::Optional => {
-            req.extensions_mut()
-                .insert(ResolvedScopes(fallback_scopes.clone()));
+            let fallback_scopes = get_scopes_snapshot(&state);
+            req.extensions_mut().insert(ResolvedScopes(fallback_scopes));
             next.run(req).await
         }
         // No token and mode is Required - reject
@@ -3083,8 +3140,8 @@ async fn auth_middleware(
         // authority is configured but no token and mode isn't matched above)
         (None, _) => {
             // Use fallback scopes - this is safe since AuthMode::Required is already handled
-            req.extensions_mut()
-                .insert(ResolvedScopes(fallback_scopes.clone()));
+            let fallback_scopes = get_scopes_snapshot(&state);
+            req.extensions_mut().insert(ResolvedScopes(fallback_scopes));
             next.run(req).await
         }
     }

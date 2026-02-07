@@ -62,6 +62,13 @@ struct Cli {
     #[arg(long = "scope", value_name = "JSON")]
     scope_json: Option<String>,
 
+    /// Path to a JSON file containing scopes that will be watched for live reload.
+    /// When this file changes, scopes are automatically reloaded without restart.
+    /// This enables dynamic permission updates (e.g., via `devaipod gator add`).
+    /// Format: {"scopes": {"gh": {"repos": {"owner/repo": {"read": true}}}}}
+    #[arg(long = "scope-file", value_name = "PATH")]
+    scope_file: Option<std::path::PathBuf>,
+
     /// Grant GitHub repo access. Format: OWNER/REPO:PERMS where PERMS is comma-separated
     /// list of: read, create-draft, pending-review, write.
     /// Example: --gh-repo myorg/myrepo:read,create-draft
@@ -214,7 +221,7 @@ fn try_main() -> Result<ExitCode> {
 
     // MCP server mode
     if let Some(addr) = cli.mcp_server {
-        return run_mcp_server(&addr, server_config);
+        return run_mcp_server(&addr, server_config, cli.scope_file);
     }
 
     // For CLI commands, we only need the scope config
@@ -230,10 +237,25 @@ fn try_main() -> Result<ExitCode> {
 }
 
 /// Run the MCP server.
-fn run_mcp_server(addr: &str, config: ServerConfig) -> Result<ExitCode> {
+fn run_mcp_server(
+    addr: &str,
+    config: ServerConfig,
+    scope_file: Option<std::path::PathBuf>,
+) -> Result<ExitCode> {
     let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
-    rt.block_on(service_gator::mcp::start_server_with_config(addr, config))
-        .context("MCP server failed")?;
+
+    rt.block_on(async {
+        // Set up scopes: file-watched if --scope-file provided, static otherwise
+        let scopes = match scope_file {
+            Some(path) => service_gator::config_watcher::watch_scopes(&path)
+                .await
+                .with_context(|| format!("loading scope file {}", path.display()))?,
+            None => service_gator::config_watcher::static_scopes(config.scopes.clone()),
+        };
+
+        service_gator::mcp::start_mcp_server(addr, config, scopes).await
+    })
+    .context("MCP server failed")?;
 
     Ok(ExitCode::SUCCESS)
 }
@@ -421,10 +443,12 @@ fn parse_gh_repo_spec(spec: &str) -> Result<(String, GhRepoPermission)> {
             "read" => perm.read = true,
             "create-draft" => perm.create_draft = true,
             "pending-review" => perm.pending_review = true,
+            "push-new-branch" => perm.push_new_branch = true,
+            "push" => perm.push_new_branch = true, // alias for convenience
             "write" => perm.write = true,
             "" => {}
             other => bail!(
-                "unknown permission '{other}'; valid: read, create-draft, pending-review, write"
+                "unknown permission '{other}'; valid: read, create-draft, pending-review, push-new-branch, write"
             ),
         }
     }
@@ -473,10 +497,12 @@ fn parse_gitlab_project_spec(spec: &str) -> Result<(String, GlProjectPermission)
             "read" => perm.read = true,
             "create-draft" => perm.create_draft = true,
             "approve" => perm.approve = true,
+            "push-new-branch" => perm.push_new_branch = true,
+            "push" => perm.push_new_branch = true, // alias for convenience
             "write" => perm.write = true,
             "" => {}
             other => {
-                bail!("unknown permission '{other}'; valid: read, create-draft, approve, write")
+                bail!("unknown permission '{other}'; valid: read, create-draft, approve, push-new-branch, write")
             }
         }
     }
@@ -500,10 +526,12 @@ fn parse_forgejo_repo_spec(spec: &str) -> Result<(String, ForgejoRepoPermission)
             "read" => perm.read = true,
             "create-draft" => perm.create_draft = true,
             "pending-review" => perm.pending_review = true,
+            "push-new-branch" => perm.push_new_branch = true,
+            "push" => perm.push_new_branch = true, // alias for convenience
             "write" => perm.write = true,
             "" => {}
             other => bail!(
-                "unknown permission '{other}'; valid: read, create-draft, pending-review, write"
+                "unknown permission '{other}'; valid: read, create-draft, pending-review, push-new-branch, write"
             ),
         }
     }

@@ -102,6 +102,7 @@ The separation of `push-new-branch` and `create-draft` permissions provides seve
 | `--forgejo-repo` | `REPO:PERMS` | `--forgejo-repo owner/repo:read` |
 | `--jira-project` | `PROJECT:PERMS` | `--jira-project MYPROJ:read,create` |
 | `--scope` | JSON | `--scope '{"gh":{"repos":{"o/r":{"read":true}}}}'` |
+| `--scope-file` | PATH | `--scope-file /etc/service-gator/scopes.json` |
 
 #### Permission Examples
 
@@ -334,6 +335,15 @@ Supported `*_FILE` variables: `GH_TOKEN_FILE`, `GITLAB_TOKEN_FILE`, `FORGEJO_TOK
 
 ### Kubernetes
 
+service-gator is designed for Kubernetes deployments with:
+
+- **`/healthz` endpoint** for liveness/readiness probes
+- **SIGTERM handling** for graceful pod termination
+- **`--scope-file`** with live reload via inotify (for ConfigMap-based configuration)
+- **`*_FILE` environment variables** for secret volume mounts
+
+#### Basic Deployment
+
 ```yaml
 apiVersion: v1
 kind: Pod
@@ -350,22 +360,24 @@ spec:
     - myorg/myrepo:read
     ports:
     - containerPort: 8080
+    livenessProbe:
+      httpGet:
+        path: /healthz
+        port: 8080
+      initialDelaySeconds: 5
+      periodSeconds: 10
+    readinessProbe:
+      httpGet:
+        path: /healthz
+        port: 8080
+      initialDelaySeconds: 2
+      periodSeconds: 5
     env:
     - name: GH_TOKEN
       valueFrom:
         secretKeyRef:
           name: service-gator-secrets
           key: gh-token
-    - name: SERVICE_GATOR_SECRET
-      valueFrom:
-        secretKeyRef:
-          name: service-gator-secrets
-          key: jwt-secret
-    - name: SERVICE_GATOR_ADMIN_KEY
-      valueFrom:
-        secretKeyRef:
-          name: service-gator-secrets
-          key: admin-key
 ---
 apiVersion: v1
 kind: Secret
@@ -374,15 +386,90 @@ metadata:
 type: Opaque
 stringData:
   gh-token: "ghp_xxxx"
-  jwt-secret: "your-256-bit-secret"
-  admin-key: "your-admin-key"
 ```
 
-## Dynamic Reconfiguration with JWT Tokens
+#### Dynamic Scopes with ConfigMap (Recommended)
 
-JWT tokens enable runtime scope changes without restarting service-gator. The primary use case is **human-approved privilege escalation**—an agent starts with minimal access, then a human can grant additional permissions based on demonstrated need or workflow requirements.
+For runtime scope updates without pod restarts, use `--scope-file` with a ConfigMap:
 
-For example, [devaipod](https://github.com/cgwalters/devaipod) uses this pattern: an orchestrator could offer `devaipod context add <pod> https://github.com/org/repo` to dynamically add another repository to a running agent's scope after human approval.
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: service-gator-scopes
+data:
+  scopes.json: |
+    {
+      "scopes": {
+        "gh": {
+          "repos": {
+            "myorg/myrepo": {"read": true, "push-new-branch": true}
+          }
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: service-gator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: service-gator
+  template:
+    metadata:
+      labels:
+        app: service-gator
+    spec:
+      containers:
+      - name: service-gator
+        image: ghcr.io/cgwalters/service-gator:latest
+        args:
+        - --mcp-server
+        - 0.0.0.0:8080
+        - --scope-file
+        - /etc/service-gator/scopes.json
+        ports:
+        - containerPort: 8080
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+        volumeMounts:
+        - name: scopes
+          mountPath: /etc/service-gator
+        - name: gh-token
+          mountPath: /run/secrets
+        env:
+        - name: GH_TOKEN_FILE
+          value: /run/secrets/gh-token
+      volumes:
+      - name: scopes
+        configMap:
+          name: service-gator-scopes
+      - name: gh-token
+        secret:
+          secretName: service-gator-secrets
+```
+
+When you update the ConfigMap, service-gator automatically reloads the scopes (via inotify) without requiring a pod restart. This enables orchestrators like [devaipod](https://github.com/cgwalters/devaipod) to dynamically grant repository access to running agents.
+
+## Dynamic Reconfiguration
+
+For runtime scope updates, **`--scope-file` with ConfigMap is the recommended approach** (see Kubernetes section above). The file is watched via inotify and reloaded automatically when changed.
+
+This enables orchestrators like [devaipod](https://github.com/cgwalters/devaipod) to dynamically grant repository access: `devaipod context add <pod> https://github.com/org/repo` updates the ConfigMap, and service-gator picks up the change immediately.
+
+### Legacy: JWT Tokens
+
+> **Note:** JWT-based dynamic scopes are soft-deprecated in favor of `--scope-file`. The file-based approach is simpler, doesn't require secret management for JWT signing, and integrates better with Kubernetes patterns.
+
+JWT tokens are still supported for cases where per-request scope embedding is needed:
+
+<details>
+<summary>JWT Token Usage (click to expand)</summary>
 
 ```bash
 # Start server with JWT auth enabled
@@ -395,7 +482,7 @@ podman run --rm -p 8080:8080 \
   --scope '{"server":{"mode":"required"}}'
 ```
 
-### Mint a Token
+#### Mint a Token
 
 ```bash
 curl -X POST http://localhost:8080/admin/mint-token \
@@ -409,10 +496,6 @@ curl -X POST http://localhost:8080/admin/mint-token \
             "read": true, 
             "push-new-branch": true, 
             "create-draft": true 
-          },
-          "upstream/repo": {
-            "read": true,
-            "create-draft": true
           }
         } 
       }
@@ -422,7 +505,7 @@ curl -X POST http://localhost:8080/admin/mint-token \
 # Returns: {"token": "eyJhbG...", "expires-at": 1706283600}
 ```
 
-### Use the Token
+#### Use the Token
 
 The agent includes the token in MCP requests:
 
@@ -430,7 +513,7 @@ The agent includes the token in MCP requests:
 Authorization: Bearer eyJhbG...
 ```
 
-### Token Rotation
+#### Token Rotation
 
 Tokens can self-rotate (refresh) without admin intervention:
 
@@ -440,6 +523,8 @@ curl -X POST http://localhost:8080/token/rotate \
   -H "Content-Type: application/json" \
   -d '{"expires-in": 3600}'
 ```
+
+</details>
 
 ## MCP Tools
 
