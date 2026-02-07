@@ -145,3 +145,36 @@ pub mod services {
         api_prefix: "/api/v1",
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_service_new() {
+        let service = CliService::new("test-cli", "/api/test");
+        assert_eq!(service.command, "test-cli");
+        assert_eq!(service.api_prefix, "/api/test");
+    }
+
+    #[test]
+    fn test_predefined_github_service() {
+        let service = services::GITHUB;
+        assert_eq!(service.command, "gh");
+        assert_eq!(service.api_prefix, "/api/v3");
+    }
+
+    #[test]
+    fn test_predefined_gitlab_service() {
+        let service = services::GITLAB;
+        assert_eq!(service.command, "glab");
+        assert_eq!(service.api_prefix, "/api/v4");
+    }
+
+    #[test]
+    fn test_predefined_forgejo_service() {
+        let service = services::FORGEJO;
+        assert_eq!(service.command, "tea");
+        assert_eq!(service.api_prefix, "/api/v1");
+    }
+}

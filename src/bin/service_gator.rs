@@ -460,6 +460,10 @@ fn load_config_file(path: &std::path::Path) -> Result<ServerConfig> {
 
 /// Merge source config into target (source values override target).
 fn merge_config(target: &mut ScopeConfig, source: ScopeConfig) {
+    // Merge GitHub global read flag
+    if source.gh.read {
+        target.gh.read = true;
+    }
     // Merge GitHub repos
     for (repo, perm) in source.gh.repos {
         target.gh.repos.insert(repo, perm);

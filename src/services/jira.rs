@@ -13,7 +13,7 @@ use crate::jira_client::JiraClient;
 use crate::scope::{OpType, ScopeConfig};
 
 /// HTTP-based JIRA API service.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct JiraHttpService;
 
 impl JiraHttpService {
@@ -33,7 +33,7 @@ impl JiraHttpService {
     ) -> Result<String> {
         // Determine operation type based on method
         let _is_write = method != "GET" && method != "HEAD";
-        
+
         // For now, route to specific methods based on endpoint patterns
         // This maintains compatibility with existing JIRA service functionality
         match (method, endpoint) {
@@ -45,9 +45,7 @@ impl JiraHttpService {
             ("GET", "/rest/api/2/project") => self.list_projects(config).await,
             ("POST", "/rest/api/2/search") => {
                 let jql = if let Some(body) = &body {
-                    body.get("jql")
-                        .and_then(|j| j.as_str())
-                        .unwrap_or("")
+                    body.get("jql").and_then(|j| j.as_str()).unwrap_or("")
                 } else {
                     ""
                 };
@@ -55,7 +53,9 @@ impl JiraHttpService {
             }
             _ => {
                 // Generic HTTP request for other endpoints
-                let response = self.make_http_request(config, method, endpoint, body).await?;
+                let response = self
+                    .make_http_request(config, method, endpoint, body)
+                    .await?;
                 Ok(serde_json::to_string_pretty(&response)?)
             }
         }
@@ -133,7 +133,9 @@ impl JiraHttpService {
         }
 
         if referenced_projects.is_empty() && !config.jira.has_any_read_access() {
-            bail!("JQL search without explicit project requires read access to at least one project");
+            bail!(
+                "JQL search without explicit project requires read access to at least one project"
+            );
         }
 
         info!(
@@ -161,12 +163,14 @@ impl JiraHttpService {
         if let Some(host) = &config.jira.host {
             if let Some(username) = &config.jira.username {
                 if let Some(token) = &config.jira.token {
-                    return JiraClient::new(host, username, token.expose_secret()).context("Failed to create JIRA client");
+                    return JiraClient::new(host, username, token.expose_secret())
+                        .context("Failed to create JIRA client");
                 }
             }
             // Try bearer token
             if let Some(token) = &config.jira.token {
-                return JiraClient::with_bearer_token(host, token.expose_secret()).context("Failed to create JIRA client");
+                return JiraClient::with_bearer_token(host, token.expose_secret())
+                    .context("Failed to create JIRA client");
             }
         }
         bail!("JIRA configuration missing required fields: host and token")
@@ -177,14 +181,14 @@ impl JiraHttpService {
         // Simple string-based extraction for project patterns
         // Look for patterns like "project = PROJ" or "project in (PROJ1, PROJ2)"
         let mut projects = Vec::new();
-        
+
         // Convert to lowercase for case-insensitive matching
         let jql_lower = jql.to_lowercase();
-        
+
         // Find project clauses
         if let Some(project_pos) = jql_lower.find("project") {
             let remaining = &jql[project_pos..];
-            
+
             // Look for project = PROJ pattern
             if let Some(eq_pos) = remaining.find('=') {
                 let after_eq = &remaining[eq_pos + 1..].trim();
@@ -201,7 +205,7 @@ impl JiraHttpService {
                     }
                 }
             }
-            
+
             // Look for project in (PROJ1, PROJ2) pattern
             if let Some(in_pos) = remaining.to_lowercase().find(" in ") {
                 let after_in = &remaining[in_pos + 4..];
@@ -218,7 +222,7 @@ impl JiraHttpService {
                 }
             }
         }
-        
+
         projects.sort();
         projects.dedup();
         Ok(projects)
@@ -234,7 +238,7 @@ impl JiraHttpService {
     ) -> Result<Value> {
         // Create client and use its HTTP capabilities
         let _client = self.create_client(config).await?;
-        
+
         // For now, we'll use the client's built-in methods where possible
         // This is a simplified implementation - a full HTTP client could be added here
         match (method, endpoint) {
@@ -246,14 +250,160 @@ impl JiraHttpService {
                     "endpoint": endpoint
                 }))
             }
-            _ => {
-                Ok(serde_json::json!({
-                    "message": "Generic JIRA HTTP endpoint",
-                    "method": method,
-                    "endpoint": endpoint,
-                    "body": body
-                }))
-            }
+            _ => Ok(serde_json::json!({
+                "message": "Generic JIRA HTTP endpoint",
+                "method": method,
+                "endpoint": endpoint,
+                "body": body
+            })),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scope::JiraProjectPermission;
+
+    fn make_jira_config_with_projects(projects: Vec<(&str, JiraProjectPermission)>) -> ScopeConfig {
+        let mut config = ScopeConfig::default();
+        for (project, perm) in projects {
+            config.jira.projects.insert(project.parse().unwrap(), perm);
+        }
+        config
+    }
+
+    // =========================================================================
+    // JiraHttpService Tests
+    // =========================================================================
+
+    #[test]
+    fn test_jira_http_service_new() {
+        let service = JiraHttpService::new();
+        // Just verify it can be created (it's a unit struct)
+        let _ = service;
+    }
+
+    // =========================================================================
+    // JQL Parsing Tests
+    // =========================================================================
+
+    #[test]
+    fn test_extract_projects_from_jql_simple() {
+        let service = JiraHttpService::new();
+
+        let result = service
+            .extract_projects_from_jql("project = MYPROJ")
+            .unwrap();
+        assert!(
+            result.contains(&"MYPROJ".to_string()),
+            "Should extract MYPROJ: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_extract_projects_from_jql_with_space() {
+        let service = JiraHttpService::new();
+
+        let result = service
+            .extract_projects_from_jql("project = PROJ AND status = Open")
+            .unwrap();
+        assert!(
+            result.contains(&"PROJ".to_string()),
+            "Should extract PROJ: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_extract_projects_from_jql_in_clause() {
+        let service = JiraHttpService::new();
+
+        let result = service
+            .extract_projects_from_jql("project in (PROJ1, PROJ2, PROJ3)")
+            .unwrap();
+        assert!(
+            result.contains(&"PROJ1".to_string()),
+            "Should contain PROJ1: {:?}",
+            result
+        );
+        assert!(
+            result.contains(&"PROJ2".to_string()),
+            "Should contain PROJ2: {:?}",
+            result
+        );
+        assert!(
+            result.contains(&"PROJ3".to_string()),
+            "Should contain PROJ3: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_extract_projects_from_jql_empty() {
+        let service = JiraHttpService::new();
+
+        let result = service.extract_projects_from_jql("status = Open").unwrap();
+        assert!(
+            result.is_empty(),
+            "Should be empty for JQL without project: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_extract_projects_from_jql_case_insensitive() {
+        let service = JiraHttpService::new();
+
+        let result = service
+            .extract_projects_from_jql("PROJECT = MYPROJ")
+            .unwrap();
+        assert!(
+            result.contains(&"MYPROJ".to_string()),
+            "Should handle uppercase PROJECT: {:?}",
+            result
+        );
+    }
+
+    // =========================================================================
+    // Permission Check Tests
+    // =========================================================================
+
+    #[test]
+    fn test_jira_config_has_any_read_access() {
+        let config =
+            make_jira_config_with_projects(vec![("PROJ", JiraProjectPermission::read_only())]);
+
+        assert!(config.jira.has_any_read_access(), "Should have read access");
+    }
+
+    #[test]
+    fn test_jira_config_no_read_access() {
+        let config = ScopeConfig::default();
+
+        assert!(
+            !config.jira.has_any_read_access(),
+            "Should not have read access"
+        );
+    }
+
+    #[test]
+    fn test_jira_is_allowed_read() {
+        let config =
+            make_jira_config_with_projects(vec![("PROJ", JiraProjectPermission::read_only())]);
+
+        assert!(config.jira.is_allowed("PROJ", OpType::Read, None));
+        assert!(!config.jira.is_allowed("OTHER", OpType::Read, None));
+    }
+
+    #[test]
+    fn test_jira_is_allowed_write() {
+        let mut perm = JiraProjectPermission::read_only();
+        perm.write = true;
+
+        let config = make_jira_config_with_projects(vec![("PROJ", perm)]);
+
+        assert!(config.jira.is_allowed("PROJ", OpType::Write, None));
     }
 }

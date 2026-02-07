@@ -35,10 +35,26 @@ impl ApiService {
         context: Option<&ServiceContext>,
     ) -> Result<String> {
         match self {
-            ApiService::GitHub(service) => service.execute_api(config, endpoint, method, body, jq, context).await,
-            ApiService::GitLab(service) => service.execute_api(config, endpoint, method, body, jq, context).await,
-            ApiService::Forgejo(service) => service.execute_api(config, endpoint, method, body, jq, context).await,
-            ApiService::Jira(service) => service.execute_api(config, endpoint, method, body, jq, context).await,
+            ApiService::GitHub(service) => {
+                service
+                    .execute_api(config, endpoint, method, body, jq, context)
+                    .await
+            }
+            ApiService::GitLab(service) => {
+                service
+                    .execute_api(config, endpoint, method, body, jq, context)
+                    .await
+            }
+            ApiService::Forgejo(service) => {
+                service
+                    .execute_api(config, endpoint, method, body, jq, context)
+                    .await
+            }
+            ApiService::Jira(service) => {
+                service
+                    .execute_api(config, endpoint, method, body, jq, context)
+                    .await
+            }
         }
     }
 }
@@ -83,7 +99,7 @@ impl PermissionChecker {
         context: Option<&ServiceContext>,
     ) -> Result<()> {
         let is_write = method != "GET" && method != "HEAD";
-        
+
         match self {
             PermissionChecker::GitHub => {
                 self.check_github_permission(config, endpoint, method, is_write)
@@ -97,14 +113,22 @@ impl PermissionChecker {
         }
     }
 
-    fn check_github_permission(&self, config: &ScopeConfig, endpoint: &str, method: &str, is_write: bool) -> Result<()> {
+    fn check_github_permission(
+        &self,
+        config: &ScopeConfig,
+        endpoint: &str,
+        method: &str,
+        is_write: bool,
+    ) -> Result<()> {
         use crate::github::{extract_repo_from_api_path, extract_resource_from_api_path};
         use crate::scope::GhOpType;
 
         // GraphQL special handling
         if endpoint == "graphql" {
             if is_write {
-                bail!("GraphQL mutations are not supported via api operation. Use dedicated tools.");
+                bail!(
+                    "GraphQL mutations are not supported via api operation. Use dedicated tools."
+                );
             }
             if !config.gh.graphql_read_allowed() {
                 bail!("GraphQL read access not allowed. Set `read = true` or `graphql = \"read\"` in [gh] config.");
@@ -120,7 +144,10 @@ impl PermissionChecker {
                 eyre::eyre!("Write operations require a repository path. Use path like repos/owner/repo/...")
             })?;
 
-            if !config.gh.is_allowed(&repo, GhOpType::WriteResource, resource_ref.as_deref()) {
+            if !config
+                .gh
+                .is_allowed(&repo, GhOpType::WriteResource, resource_ref.as_deref())
+            {
                 let scope_msg = if let Some(ref res) = resource_ref {
                     format!(" (resource: {})", res)
                 } else {
@@ -155,16 +182,26 @@ impl PermissionChecker {
         Ok(())
     }
 
-    fn check_gitlab_permission(&self, config: &ScopeConfig, endpoint: &str, method: &str, is_write: bool) -> Result<()> {
+    fn check_gitlab_permission(
+        &self,
+        config: &ScopeConfig,
+        endpoint: &str,
+        method: &str,
+        is_write: bool,
+    ) -> Result<()> {
         use crate::gitlab::extract_project_from_api_path;
         use crate::scope::GlOpType;
 
         if endpoint == "graphql" {
             if is_write {
-                bail!("GraphQL mutations are not supported via api operation. Use dedicated tools.");
+                bail!(
+                    "GraphQL mutations are not supported via api operation. Use dedicated tools."
+                );
             }
             if !config.gitlab.graphql_read_allowed() {
-                bail!("GraphQL read access not allowed. Set `graphql = \"read\"` in [gitlab] config.");
+                bail!(
+                    "GraphQL read access not allowed. Set `graphql = \"read\"` in [gitlab] config."
+                );
             }
             return Ok(());
         }
@@ -176,7 +213,10 @@ impl PermissionChecker {
                 eyre::eyre!("Write operations require a project path. Use path like /api/v4/projects/group%2Fproject/...")
             })?;
 
-            if !config.gitlab.is_allowed(&project, GlOpType::WriteResource, None) {
+            if !config
+                .gitlab
+                .is_allowed(&project, GlOpType::WriteResource, None)
+            {
                 bail!("Write access not allowed for project: {project}");
             }
 
@@ -290,7 +330,10 @@ impl PermissionChecker {
                     return Ok(scope);
                 }
             }
-            bail!("No configured Forgejo host has access to repository: {}", repo_path);
+            bail!(
+                "No configured Forgejo host has access to repository: {}",
+                repo_path
+            );
         }
 
         // Priority 3: Use first configured scope
@@ -309,7 +352,8 @@ impl CliServiceAdapter {
         context: Option<&ServiceContext>,
     ) -> Result<String> {
         // Check permissions first
-        self.permission_checker.check_permission(config, endpoint, method, context)?;
+        self.permission_checker
+            .check_permission(config, endpoint, method, context)?;
 
         // Extract host for multi-host services
         let host = context.and_then(|c| c.host.as_deref());
@@ -329,7 +373,9 @@ impl JiraServiceAdapter {
         jq: Option<&str>,
         _context: Option<&ServiceContext>,
     ) -> Result<String> {
-        self.jira.execute_api(config, endpoint, method, body, jq).await
+        self.jira
+            .execute_api(config, endpoint, method, body, jq)
+            .await
     }
 }
 
@@ -385,10 +431,333 @@ impl ServiceRegistry {
             _ => None,
         }
     }
+
+    /// Get the GitHub service directly.
+    ///
+    /// Used for github.localhost compatibility where paths don't have /api/v3 prefix.
+    pub fn github(&self) -> &ApiService {
+        &self.github
+    }
 }
 
 impl Default for ServiceRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scope::{GhRepoPermission, GlProjectPermission};
+    use std::collections::HashMap;
+
+    // =========================================================================
+    // PermissionChecker Tests
+    // =========================================================================
+
+    fn make_github_config_with_repos(repos: Vec<(&str, GhRepoPermission)>) -> ScopeConfig {
+        let mut config = ScopeConfig::default();
+        for (repo, perm) in repos {
+            config.gh.repos.insert(repo.to_string(), perm);
+        }
+        config
+    }
+
+    fn make_gitlab_config_with_projects(projects: Vec<(&str, GlProjectPermission)>) -> ScopeConfig {
+        let mut config = ScopeConfig::default();
+        for (project, perm) in projects {
+            config.gitlab.projects.insert(project.to_string(), perm);
+        }
+        config
+    }
+
+    #[test]
+    fn test_permission_checker_github_read_allowed() {
+        let checker = PermissionChecker::GitHub;
+        let config =
+            make_github_config_with_repos(vec![("owner/repo", GhRepoPermission::read_only())]);
+
+        // Read should be allowed for configured repo
+        let result = checker.check_permission(&config, "repos/owner/repo", "GET", None);
+        assert!(result.is_ok(), "Expected read to be allowed");
+    }
+
+    #[test]
+    fn test_permission_checker_github_read_denied() {
+        let checker = PermissionChecker::GitHub;
+        let config =
+            make_github_config_with_repos(vec![("owner/repo", GhRepoPermission::read_only())]);
+
+        // Read should be denied for unconfigured repo
+        let result = checker.check_permission(&config, "repos/other/repo", "GET", None);
+        assert!(result.is_err(), "Expected read to be denied");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not allowed"),
+            "Error should mention access not allowed: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_permission_checker_github_write_denied_without_permission() {
+        let checker = PermissionChecker::GitHub;
+        let config =
+            make_github_config_with_repos(vec![("owner/repo", GhRepoPermission::read_only())]);
+
+        // Write (POST) should be denied for read-only repos
+        let result = checker.check_permission(&config, "repos/owner/repo/issues", "POST", None);
+        assert!(result.is_err(), "Expected write to be denied");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Write access not allowed"),
+            "Error should mention write not allowed: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_permission_checker_github_write_allowed_with_permission() {
+        let checker = PermissionChecker::GitHub;
+        let config =
+            make_github_config_with_repos(vec![("owner/repo", GhRepoPermission::full_write())]);
+
+        // Write should be allowed for repos with write permission
+        let result = checker.check_permission(&config, "repos/owner/repo/issues", "POST", None);
+        assert!(result.is_ok(), "Expected write to be allowed");
+    }
+
+    #[test]
+    fn test_permission_checker_github_graphql_read_denied_by_default() {
+        let checker = PermissionChecker::GitHub;
+        let config =
+            make_github_config_with_repos(vec![("owner/repo", GhRepoPermission::read_only())]);
+
+        // GraphQL read should be denied by default
+        let result = checker.check_permission(&config, "graphql", "GET", None);
+        assert!(
+            result.is_err(),
+            "Expected GraphQL read to be denied by default"
+        );
+    }
+
+    #[test]
+    fn test_permission_checker_github_graphql_write_always_denied() {
+        let checker = PermissionChecker::GitHub;
+        let mut config = ScopeConfig::default();
+        config.gh.read = true; // Enable global read
+
+        // GraphQL write (mutation) should always be denied
+        let result = checker.check_permission(&config, "graphql", "POST", None);
+        assert!(result.is_err(), "Expected GraphQL write to be denied");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutations"),
+            "Error should mention mutations: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_permission_checker_github_global_read() {
+        let checker = PermissionChecker::GitHub;
+        let mut config = ScopeConfig::default();
+        config.gh.read = true; // Enable global read
+
+        // Any read should be allowed with global read
+        let result = checker.check_permission(&config, "repos/any/repo", "GET", None);
+        assert!(result.is_ok(), "Expected global read to allow any repo");
+
+        // Non-repo endpoints should also work
+        let result = checker.check_permission(&config, "user", "GET", None);
+        assert!(
+            result.is_ok(),
+            "Expected global read to allow user endpoint"
+        );
+    }
+
+    #[test]
+    fn test_permission_checker_github_non_repo_endpoint_denied() {
+        let checker = PermissionChecker::GitHub;
+        let config =
+            make_github_config_with_repos(vec![("owner/repo", GhRepoPermission::read_only())]);
+
+        // Non-repo endpoints should be denied without global read
+        let result = checker.check_permission(&config, "user", "GET", None);
+        assert!(result.is_err(), "Expected non-repo endpoint to be denied");
+    }
+
+    #[test]
+    fn test_permission_checker_gitlab_read_allowed() {
+        let checker = PermissionChecker::GitLab;
+        let config = make_gitlab_config_with_projects(vec![(
+            "group/project",
+            GlProjectPermission::read_only(),
+        )]);
+
+        // Read should be allowed for configured project
+        let result = checker.check_permission(&config, "projects/group%2Fproject", "GET", None);
+        assert!(result.is_ok(), "Expected read to be allowed");
+    }
+
+    #[test]
+    fn test_permission_checker_gitlab_write_denied() {
+        let checker = PermissionChecker::GitLab;
+        let config = make_gitlab_config_with_projects(vec![(
+            "group/project",
+            GlProjectPermission::read_only(),
+        )]);
+
+        // Write should be denied for read-only projects
+        let result =
+            checker.check_permission(&config, "projects/group%2Fproject/issues", "POST", None);
+        assert!(result.is_err(), "Expected write to be denied");
+    }
+
+    // =========================================================================
+    // ServiceRegistry Tests
+    // =========================================================================
+
+    #[test]
+    fn test_service_registry_get_service_github() {
+        let registry = ServiceRegistry::new();
+
+        let service = registry.get_service("/api/v3/repos/owner/repo");
+        assert!(
+            service.is_some(),
+            "Expected GitHub service for /api/v3 path"
+        );
+    }
+
+    #[test]
+    fn test_service_registry_get_service_gitlab() {
+        let registry = ServiceRegistry::new();
+
+        let service = registry.get_service("/api/v4/projects/123");
+        assert!(
+            service.is_some(),
+            "Expected GitLab service for /api/v4 path"
+        );
+    }
+
+    #[test]
+    fn test_service_registry_get_service_forgejo() {
+        let registry = ServiceRegistry::new();
+
+        let service = registry.get_service("/api/v1/repos/owner/repo");
+        assert!(
+            service.is_some(),
+            "Expected Forgejo service for /api/v1 path"
+        );
+    }
+
+    #[test]
+    fn test_service_registry_get_service_jira() {
+        let registry = ServiceRegistry::new();
+
+        let service = registry.get_service("/rest/api/2/issue/PROJ-123");
+        assert!(
+            service.is_some(),
+            "Expected JIRA service for /rest/api path"
+        );
+    }
+
+    #[test]
+    fn test_service_registry_get_service_unknown() {
+        let registry = ServiceRegistry::new();
+
+        let service = registry.get_service("/unknown/path");
+        assert!(service.is_none(), "Expected None for unknown path");
+    }
+
+    #[test]
+    fn test_service_registry_get_service_by_name() {
+        let registry = ServiceRegistry::new();
+
+        assert!(registry.get_service_by_name("github").is_some());
+        assert!(registry.get_service_by_name("gitlab").is_some());
+        assert!(registry.get_service_by_name("forgejo").is_some());
+        assert!(registry.get_service_by_name("gitea").is_some()); // alias for forgejo
+        assert!(registry.get_service_by_name("jira").is_some());
+        assert!(registry.get_service_by_name("unknown").is_none());
+    }
+
+    // =========================================================================
+    // PermissionChecker Forgejo Tests
+    // =========================================================================
+
+    #[test]
+    fn test_permission_checker_forgejo_no_hosts_configured() {
+        let checker = PermissionChecker::Forgejo;
+        let config = ScopeConfig::default(); // No forgejo hosts
+
+        let result = checker.check_permission(&config, "repos/owner/repo", "GET", None);
+        assert!(
+            result.is_err(),
+            "Expected error when no Forgejo hosts configured"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("No Forgejo hosts configured"),
+            "Error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_permission_checker_forgejo_with_host() {
+        let checker = PermissionChecker::Forgejo;
+        let mut config = ScopeConfig::default();
+
+        let mut repos = HashMap::new();
+        repos.insert(
+            "owner/repo".to_string(),
+            crate::scope::ForgejoRepoPermission::read_only(),
+        );
+
+        config.forgejo.push(ForgejoScope {
+            host: "codeberg.org".to_string(),
+            token: None,
+            repos,
+            prs: HashMap::new(),
+            issues: HashMap::new(),
+        });
+
+        // Should work with host hint in context
+        let context = ServiceContext {
+            host: Some("codeberg.org".to_string()),
+            params: HashMap::new(),
+        };
+        let result = checker.check_permission(&config, "repos/owner/repo", "GET", Some(&context));
+        assert!(result.is_ok(), "Expected read to be allowed: {:?}", result);
+    }
+
+    // =========================================================================
+    // ServiceContext Tests
+    // =========================================================================
+
+    #[test]
+    fn test_service_context_with_host() {
+        let context = ServiceContext {
+            host: Some("example.com".to_string()),
+            params: HashMap::new(),
+        };
+
+        assert_eq!(context.host, Some("example.com".to_string()));
+        assert!(context.params.is_empty());
+    }
+
+    #[test]
+    fn test_service_context_with_params() {
+        let mut params = HashMap::new();
+        params.insert("key1".to_string(), "value1".to_string());
+        params.insert("key2".to_string(), "value2".to_string());
+
+        let context = ServiceContext { host: None, params };
+
+        assert!(context.host.is_none());
+        assert_eq!(context.params.get("key1"), Some(&"value1".to_string()));
+        assert_eq!(context.params.get("key2"), Some(&"value2".to_string()));
     }
 }
