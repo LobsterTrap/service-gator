@@ -239,13 +239,29 @@ pub struct VersionListArgs {
 
 #[derive(Parser, Debug, Clone)]
 pub struct SearchCommand {
-    /// JQL query string
+    /// Project key(s) to search within (required for authorization).
+    /// The search will be scoped to these projects.
+    /// Can be specified multiple times: -p PROJ1 -p PROJ2
+    #[arg(short = 'p', long = "project", required = true)]
+    pub projects: Vec<JiraProjectKey>,
+
+    /// JQL query string (applied within the specified projects)
     #[arg(short = 'q', long = "jql")]
     pub jql: String,
 
     /// Output format (json, table)
     #[arg(short = 'o', long = "output")]
     pub output: Option<String>,
+}
+
+impl SearchCommand {
+    /// Build the effective JQL by prepending a project filter.
+    ///
+    /// This ensures the search is scoped to the explicitly authorized projects,
+    /// regardless of what the user-provided JQL contains.
+    pub fn effective_jql(&self) -> String {
+        crate::services::jira::build_scoped_jql(&self.projects, &self.jql)
+    }
 }
 
 // ============================================================================
@@ -381,11 +397,22 @@ fn extract_metadata(cmd: &JiraCommand) -> (Option<String>, Option<String>, Strin
                 format!("jira version list -p {}", args.project),
             ),
         },
-        JiraSubcommand::Search(search_cmd) => (
-            None,
-            None,
-            format!("jira search --jql '{}'", search_cmd.jql),
-        ),
+        JiraSubcommand::Search(search_cmd) => {
+            // Use the first project as the primary project for permission checking.
+            // All projects are validated separately by the caller.
+            let primary_project = search_cmd.projects.first().map(|p| p.as_str().to_string());
+            let projects_str = search_cmd
+                .projects
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            (
+                primary_project,
+                None,
+                format!("jira search -p {} --jql '{}'", projects_str, search_cmd.jql),
+            )
+        }
     }
 }
 
@@ -501,11 +528,13 @@ pub fn build_command_args(cmd: &ValidatedJiraCommand) -> Vec<String> {
             }
         },
         JiraSubcommand::Search(search_cmd) => {
-            let mut result = vec![
-                "search".to_string(),
-                "-q".to_string(),
-                search_cmd.jql.clone(),
-            ];
+            let mut result = vec!["search".to_string()];
+            for project in &search_cmd.projects {
+                result.push("-p".to_string());
+                result.push(project.to_string());
+            }
+            result.push("-q".to_string());
+            result.push(search_cmd.jql.clone());
             if let Some(ref output) = search_cmd.output {
                 result.push("-o".to_string());
                 result.push(output.clone());
@@ -760,11 +789,27 @@ mod tests {
 
     #[test]
     fn test_parse_search() {
-        let result = parse_command(&args("search -q project=MYPROJ")).unwrap();
+        let result = parse_command(&args("search -p MYPROJ -q status=Open")).unwrap();
         assert!(result.description.contains("search"));
+        assert_eq!(result.project.as_deref(), Some("MYPROJ"));
 
         let op_type = classify_command(&result);
         assert_eq!(op_type, OpType::Read);
+    }
+
+    #[test]
+    fn test_parse_search_multiple_projects() {
+        let result = parse_command(&args("search -p PROJ1 -p PROJ2 -q status=Open")).unwrap();
+        assert!(result.description.contains("PROJ1"));
+        assert!(result.description.contains("PROJ2"));
+        assert_eq!(result.project.as_deref(), Some("PROJ1"));
+    }
+
+    #[test]
+    fn test_parse_search_requires_project() {
+        // Search without -p should fail
+        let err = parse_command(&args("search -q status=Open"));
+        assert!(err.is_err(), "Search without project should fail");
     }
 
     #[test]
@@ -811,7 +856,7 @@ mod tests {
         let cmd = parse_command(&args("project list")).unwrap();
         assert_eq!(classify_command(&cmd), OpType::Read);
 
-        let cmd = parse_command(&args("search -q status=Open")).unwrap();
+        let cmd = parse_command(&args("search -p PROJ -q status=Open")).unwrap();
         assert_eq!(classify_command(&cmd), OpType::Read);
     }
 
@@ -874,12 +919,60 @@ mod tests {
 
     #[test]
     fn test_build_search_args() {
-        let cmd = parse_command(&args("search -q status=Open -o table")).unwrap();
+        let cmd = parse_command(&args("search -p PROJ -q status=Open -o table")).unwrap();
         let built = build_command_args(&cmd);
         assert_eq!(built[0], "search");
-        assert_eq!(built[1], "-q");
-        assert_eq!(built[2], "status=Open");
-        assert_eq!(built[3], "-o");
-        assert_eq!(built[4], "table");
+        assert_eq!(built[1], "-p");
+        assert_eq!(built[2], "PROJ");
+        assert_eq!(built[3], "-q");
+        assert_eq!(built[4], "status=Open");
+        assert_eq!(built[5], "-o");
+        assert_eq!(built[6], "table");
+    }
+
+    // ========================================================================
+    // Tests for SearchCommand::effective_jql()
+    // ========================================================================
+
+    #[test]
+    fn test_effective_jql_single_project() {
+        let cmd = parse_command(&args("search -p PROJ -q status=Open")).unwrap();
+        if let JiraSubcommand::Search(ref search) = cmd.command.command {
+            assert_eq!(search.effective_jql(), "(project = PROJ) AND (status=Open)");
+        } else {
+            panic!("Expected Search command");
+        }
+    }
+
+    #[test]
+    fn test_effective_jql_multiple_projects() {
+        let cmd = parse_command(&args("search -p PROJ1 -p PROJ2 -q status=Open")).unwrap();
+        if let JiraSubcommand::Search(ref search) = cmd.command.command {
+            assert_eq!(
+                search.effective_jql(),
+                "(project in (PROJ1, PROJ2)) AND (status=Open)"
+            );
+        } else {
+            panic!("Expected Search command");
+        }
+    }
+
+    #[test]
+    fn test_effective_jql_empty_jql() {
+        // Construct args directly since split_whitespace can't produce an empty string
+        let cmd_args = vec![
+            "search".to_string(),
+            "-p".to_string(),
+            "PROJ".to_string(),
+            "-q".to_string(),
+            "".to_string(),
+        ];
+        let cmd = parse_command(&cmd_args).unwrap();
+        if let JiraSubcommand::Search(ref search) = cmd.command.command {
+            // Empty JQL string means just the project filter
+            assert_eq!(search.effective_jql(), "project = PROJ");
+        } else {
+            panic!("Expected Search command");
+        }
     }
 }

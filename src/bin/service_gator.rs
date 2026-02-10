@@ -26,6 +26,7 @@ use service_gator::scope::{
     ForgejoRepoPermission, ForgejoScope, GhRepoPermission, GlProjectPermission,
     JiraProjectPermission, ScopeConfig,
 };
+use service_gator::servers::{run_servers, ForgeServers, ServerMode};
 
 /// Initialize tracing with env-filter support (RUST_LOG).
 fn init_tracing() {
@@ -52,6 +53,38 @@ struct Cli {
     /// Start MCP server on the given address (e.g., 127.0.0.1:8080)
     #[arg(long = "mcp-server", value_name = "ADDR")]
     mcp_server: Option<String>,
+
+    /// Start all REST API forge servers on consecutive ports starting at ADDR.
+    /// Convenience alias: GitHub=ADDR, GitLab=+1, Forgejo=+2, JIRA=+3.
+    #[arg(long = "rest-server", value_name = "ADDR")]
+    rest_server: Option<String>,
+
+    /// Start GitHub REST proxy on 127.0.0.1:PORT (e.g., --github-port 8081)
+    #[arg(long = "github-port", value_name = "PORT")]
+    github_port: Option<u16>,
+
+    /// Start GitLab REST proxy on 127.0.0.1:PORT (e.g., --gitlab-port 8082)
+    #[arg(long = "gitlab-port", value_name = "PORT")]
+    gitlab_port: Option<u16>,
+
+    /// Start Forgejo REST proxy on 127.0.0.1:PORT (e.g., --forgejo-port 8083)
+    #[arg(long = "forgejo-port", value_name = "PORT")]
+    forgejo_port: Option<u16>,
+
+    /// Start JIRA REST proxy on 127.0.0.1:PORT (e.g., --jira-port 8084)
+    #[arg(long = "jira-port", value_name = "PORT")]
+    jira_port: Option<u16>,
+
+    /// Start both MCP and REST servers (dual mode)
+    /// MCP server runs on --mcp-server address (default: 127.0.0.1:8080)
+    /// REST servers run on --rest-server or per-forge ports (default: 127.0.0.1:8081+)
+    #[arg(long = "dual-mode")]
+    dual_mode: bool,
+
+    /// Start HTTP proxy server on the given address (e.g., 127.0.0.1:8082)
+    /// Transparent proxy for CLI tools like gh, glab, etc.
+    #[arg(long = "http-proxy", value_name = "ADDR")]
+    http_proxy: Option<String>,
 
     /// Path to a TOML configuration file
     #[arg(long = "config", value_name = "PATH")]
@@ -219,9 +252,21 @@ fn try_main() -> Result<ExitCode> {
     // Build config from file + CLI args
     let server_config = build_config(&cli)?;
 
-    // MCP server mode
-    if let Some(addr) = cli.mcp_server {
-        return run_mcp_server(&addr, server_config, cli.scope_file);
+    // Server mode - determine which server(s) to start
+    let server_mode = determine_server_mode(&cli)?;
+    if let Some((mode, mcp_addr, forge_servers)) = server_mode {
+        return run_servers_mode(
+            mode,
+            mcp_addr.as_deref(),
+            &forge_servers,
+            server_config,
+            cli.scope_file,
+        );
+    }
+
+    // HTTP proxy mode (separate from MCP/REST servers)
+    if let Some(addr) = cli.http_proxy {
+        return run_proxy_server(&addr, server_config);
     }
 
     // For CLI commands, we only need the scope config
@@ -236,9 +281,120 @@ fn try_main() -> Result<ExitCode> {
     }
 }
 
-/// Run the MCP server.
-fn run_mcp_server(
-    addr: &str,
+/// Run the HTTP proxy server.
+fn run_proxy_server(addr: &str, config: ServerConfig) -> Result<ExitCode> {
+    let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
+    rt.block_on(service_gator::proxy::start_proxy_server(addr, config))
+        .context("HTTP proxy server failed")?;
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Format a localhost address from a port number.
+fn localhost(port: u16) -> String {
+    format!("127.0.0.1:{}", port)
+}
+
+/// Build a ForgeServers from CLI flags.
+///
+/// Per-forge `--*-port` flags take priority over `--rest-server`.
+/// If `--rest-server` is given without any per-forge flags, it expands to all
+/// four forges on consecutive ports.
+fn build_forge_servers(cli: &Cli) -> Result<ForgeServers> {
+    let has_per_forge = cli.github_port.is_some()
+        || cli.gitlab_port.is_some()
+        || cli.forgejo_port.is_some()
+        || cli.jira_port.is_some();
+
+    if has_per_forge {
+        // Per-forge ports are authoritative. If --rest-server is also given,
+        // use it as a base for any forges not explicitly configured.
+        let base = cli
+            .rest_server
+            .as_deref()
+            .map(ForgeServers::from_base_addr)
+            .transpose()?
+            .unwrap_or_default();
+
+        Ok(ForgeServers {
+            github: cli.github_port.map(localhost).or(base.github),
+            gitlab: cli.gitlab_port.map(localhost).or(base.gitlab),
+            forgejo: cli.forgejo_port.map(localhost).or(base.forgejo),
+            jira: cli.jira_port.map(localhost).or(base.jira),
+        })
+    } else if let Some(ref base_addr) = cli.rest_server {
+        // --rest-server with no per-forge flags: expand to all four forges.
+        let servers = ForgeServers::from_base_addr(base_addr)?;
+        tracing::info!(
+            "--rest-server {}: GitHub={}, GitLab={}, Forgejo={}, JIRA={}",
+            base_addr,
+            servers.github.as_deref().unwrap_or("-"),
+            servers.gitlab.as_deref().unwrap_or("-"),
+            servers.forgejo.as_deref().unwrap_or("-"),
+            servers.jira.as_deref().unwrap_or("-"),
+        );
+        Ok(servers)
+    } else {
+        Ok(ForgeServers::default())
+    }
+}
+
+/// Determine which server mode to use based on CLI flags.
+#[allow(clippy::type_complexity)]
+fn determine_server_mode(cli: &Cli) -> Result<Option<(ServerMode, Option<String>, ForgeServers)>> {
+    let has_mcp = cli.mcp_server.is_some();
+    let has_rest = cli.rest_server.is_some();
+    let has_per_forge = cli.github_port.is_some()
+        || cli.gitlab_port.is_some()
+        || cli.forgejo_port.is_some()
+        || cli.jira_port.is_some();
+    let has_any_rest = has_rest || has_per_forge;
+    let dual_mode = cli.dual_mode;
+
+    match (has_mcp, has_any_rest, dual_mode) {
+        // No server flags
+        (false, false, false) => Ok(None),
+
+        // MCP only
+        (true, false, false) => Ok(Some((
+            ServerMode::Mcp,
+            cli.mcp_server.clone(),
+            ForgeServers::default(),
+        ))),
+
+        // REST only
+        (false, true, false) => {
+            let forge_servers = build_forge_servers(cli)?;
+            Ok(Some((ServerMode::Rest, None, forge_servers)))
+        }
+
+        // Dual mode (--dual-mode flag or both MCP + REST specified)
+        _ if dual_mode || (has_mcp && has_any_rest) => {
+            let mcp_addr = cli
+                .mcp_server
+                .clone()
+                .or_else(|| Some("127.0.0.1:8080".to_string()));
+
+            let forge_servers = if has_any_rest {
+                build_forge_servers(cli)?
+            } else {
+                // --dual-mode with no REST flags: use defaults
+                ForgeServers::from_base_addr("127.0.0.1:8081")?
+            };
+
+            Ok(Some((ServerMode::Dual, mcp_addr, forge_servers)))
+        }
+
+        // Should not reach here, but handle gracefully
+        _ => Ok(None),
+    }
+}
+
+/// Run server(s) based on the determined mode with optional scope file watching.
+fn run_servers_mode(
+    mode: ServerMode,
+    mcp_addr: Option<&str>,
+    forge_servers: &ForgeServers,
     config: ServerConfig,
     scope_file: Option<std::path::PathBuf>,
 ) -> Result<ExitCode> {
@@ -253,9 +409,9 @@ fn run_mcp_server(
             None => service_gator::config_watcher::static_scopes(config.scopes.clone()),
         };
 
-        service_gator::mcp::start_mcp_server(addr, config, scopes).await
+        run_servers(mode, mcp_addr, forge_servers, config, scopes).await
     })
-    .context("MCP server failed")?;
+    .context("server(s) failed")?;
 
     Ok(ExitCode::SUCCESS)
 }
@@ -371,6 +527,10 @@ fn load_config_file(path: &std::path::Path) -> Result<ServerConfig> {
 
 /// Merge source config into target (source values override target).
 fn merge_config(target: &mut ScopeConfig, source: ScopeConfig) {
+    // Merge GitHub global read flag
+    if source.gh.read {
+        target.gh.read = true;
+    }
     // Merge GitHub repos
     for (repo, perm) in source.gh.repos {
         target.gh.repos.insert(repo, perm);

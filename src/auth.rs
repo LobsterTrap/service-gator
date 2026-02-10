@@ -123,6 +123,7 @@ impl Default for RotationConfig {
 }
 
 /// Token signing and validation.
+#[derive(Clone)]
 pub struct TokenAuthority {
     encoding_key: EncodingKey,
     decoding_key: DecodingKey,

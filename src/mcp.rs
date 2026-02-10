@@ -2042,7 +2042,7 @@ impl ServiceGatorServer {
     /// Only explicitly allowed commands and options are permitted.
     /// Unknown commands or options are rejected for security.
     #[tool(
-        description = "Execute JIRA commands within configured scopes. Allowed commands: issue (list/show/create/transition/assign), project list, version list, search. Only explicitly allowed options are permitted. Use the 'status' tool to view current capabilities."
+        description = "Execute JIRA commands within configured scopes. Allowed commands: issue (list/show/create/transition/assign), project list, version list, search. Only explicitly allowed options are permitted. Use the 'status' tool to view current capabilities.\n\nSearch requires explicit project(s): search -p PROJECT [-p PROJECT2] -q JQL"
     )]
     async fn jira(
         &self,
@@ -2066,7 +2066,7 @@ impl ServiceGatorServer {
                      issue assign -i ISSUE-KEY [-a ASSIGNEE]\n  \
                      project list\n  \
                      version list -p PROJECT\n  \
-                     search -q JQL\n\n\
+                     search -p PROJECT [-p PROJECT2] -q JQL\n\n\
                      For capability information, use the 'status' tool.",
                     e
                 ))]));
@@ -2076,9 +2076,8 @@ impl ServiceGatorServer {
         // Get the operation type
         let op_type = jira::classify_command(&validated);
 
-        // For project list and search, we don't need a specific project
+        // For project list, we don't need a specific project
         let is_project_list = matches!(validated.command.command, JiraSubcommand::Project(_));
-        let is_search = matches!(validated.command.command, JiraSubcommand::Search(_));
 
         // Determine target project for permission checking
         let project = validated
@@ -2104,8 +2103,21 @@ impl ServiceGatorServer {
             }
         };
 
-        // For project list and search, just check that at least one project is configured
-        if is_project_list || is_search {
+        // For search, validate read permissions for each explicitly listed project
+        if let JiraSubcommand::Search(ref search_cmd) = validated.command.command {
+            for project_key in &search_cmd.projects {
+                if !config
+                    .jira
+                    .is_allowed(project_key.as_str(), OpType::Read, None)
+                {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Read access not allowed for project: {}",
+                        project_key
+                    ))]));
+                }
+            }
+        } else if is_project_list {
+            // For project list, just check that at least one project is configured
             if config.jira.projects.is_empty() {
                 return Ok(CallToolResult::error(vec![Content::text(
                     "No JIRA projects configured",
@@ -2354,7 +2366,9 @@ async fn execute_jira_command(
             }
         },
         JiraSubcommand::Search(search_cmd) => {
-            let results = client.search(&search_cmd.jql).await?;
+            // Use effective_jql() which prepends the authorized project filter
+            let jql = search_cmd.effective_jql();
+            let results = client.search(&jql).await?;
             Ok(serde_json::to_string_pretty(&results)?)
         }
     }
