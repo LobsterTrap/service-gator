@@ -466,6 +466,48 @@ pub fn validate_review_pending(review_json: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// Extended help text for the pending review tool.
+pub const REVIEW_TOOL_HELP: &str = "\
+# Pending Review Tool
+
+Manage pending (draft) PR reviews on GitHub. Reviews are created in PENDING \
+state and must be submitted by a human through the GitHub UI.
+
+## Operations
+
+- create: Create a pending review. Errors if a pending service-gator review \
+already exists on this PR; set replace=true to delete the existing one first. \
+Provide 'body' (review summary) and optionally 'comments' (inline comments \
+on specific lines).
+- list: List all reviews on a PR.
+- get: Get a specific review by review_id.
+- update: Update the body text of an existing pending review (by review_id). \
+Cannot modify inline comments — use create to replace the whole review instead.
+- delete: Delete a pending review by review_id.
+- extended-help: Show this help text.
+
+## Dry Run
+
+Set dry_run: true with the 'create' operation to validate inputs without \
+submitting. Returns a summary of what would be created.
+
+## Example (create)
+
+  operation: \"create\"
+  repo: \"owner/repo\"
+  pull_number: 42
+  body: \"Review summary text.\"
+  comments:
+    - path: \"src/lib.rs\", line: 42, body: \"Consider adding error handling here.\"
+    - path: \"src/main.rs\", line: 15, body: \"Use eprintln! for error output.\"
+
+## Marker Token
+
+All reviews created by this tool include a hidden marker token in the body. \
+This allows the tool to identify its own pending reviews for idempotent \
+replacement. Only reviews with this marker can be updated or deleted.
+";
+
 /// Analyze a `gh` command to determine target repo and read/write classification.
 /// Note: In API-only mode, prefer using `analyze_api()` directly.
 pub fn analyze(args: &[String]) -> GhAnalysis {

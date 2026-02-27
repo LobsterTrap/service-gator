@@ -57,7 +57,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 use crate::forgejo;
 use crate::forgejo_client::{self, ForgejoClient};
 use crate::git::{BranchDescription, CommitSha, PullRequestNumber, RepoName};
-use crate::github::{self, PendingReviewOp, REVIEW_MARKER_TOKEN};
+use crate::github::{self, PendingReviewOp, REVIEW_MARKER_TOKEN, REVIEW_TOOL_HELP};
 use crate::gitlab;
 use crate::jira::{self, JiraSubcommand};
 use crate::jira_client::JiraClient;
@@ -121,7 +121,8 @@ fn default_true() -> bool {
 /// Input schema for managing pending PR reviews.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct GithubPendingReviewInput {
-    /// The operation to perform: "list", "create", "get", "update", "delete"
+    /// The operation to perform: "list", "create", "get", "update", "delete",
+    /// or "extended-help"
     pub operation: String,
     /// Repository in "owner/repo" format
     pub repo: String,
@@ -136,6 +137,14 @@ pub struct GithubPendingReviewInput {
     /// Review comments for create operation
     #[serde(default)]
     pub comments: Option<Vec<ReviewComment>>,
+    /// If true, validate the inputs without submitting (create operation only).
+    #[serde(default)]
+    pub dry_run: bool,
+    /// If true, delete any existing pending service-gator review before
+    /// creating a new one (create operation only). Without this, create
+    /// will fail if a pending review already exists.
+    #[serde(default)]
+    pub replace: bool,
 }
 
 /// Input schema for GitLab CLI tool.
@@ -234,10 +243,10 @@ pub struct ReviewComment {
     /// The relative path to the file
     pub path: String,
     /// The line number in the file (new version)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
     /// The side of the diff (LEFT or RIGHT)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub side: Option<String>,
     /// The comment body
     pub body: String,
@@ -1283,6 +1292,8 @@ impl ServiceGatorServer {
         review_id: Option<u64>,
         body: Option<&str>,
         comments: Option<Vec<ReviewComment>>,
+        dry_run: bool,
+        replace: bool,
     ) -> Result<CallToolResult, McpError> {
         // Check permission
         if !config
@@ -1303,10 +1314,23 @@ impl ServiceGatorServer {
             "delete" => PendingReviewOp::Delete,
             other => {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Unknown review-operation: {other}. Use: list, create, get, update, delete"
+                    "Unknown operation: {other}. \
+                     Use: list, create, get, update, delete, extended-help"
                 ))]));
             }
         };
+
+        // dry_run and replace only valid for create
+        if dry_run && op != PendingReviewOp::Create {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "dry_run is only supported with the 'create' operation",
+            )]));
+        }
+        if replace && op != PendingReviewOp::Create {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "replace is only supported with the 'create' operation",
+            )]));
+        }
 
         // Validate review_id for operations that need it
         if matches!(
@@ -1371,13 +1395,6 @@ impl ServiceGatorServer {
             }
 
             PendingReviewOp::Create => {
-                tracing::info!(
-                    operation = "github_pending_review",
-                    action = "create",
-                    repo = %repo,
-                    pull_number = pull_number,
-                    "creating pending review"
-                );
                 let body_text = body.unwrap_or("");
                 let body_with_marker = if body_text.contains(REVIEW_MARKER_TOKEN) {
                     body_text.to_string()
@@ -1392,6 +1409,92 @@ impl ServiceGatorServer {
                 if let Some(ref comments) = comments {
                     payload["comments"] = serde_json::to_value(comments).unwrap_or_default();
                 }
+
+                let comment_count = comments.as_ref().map_or(0, |c| c.len());
+
+                // Dry run: return a summary without submitting
+                if dry_run {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Dry run: would create pending review on {repo}#{pull_number}\n\
+                         Body: {} chars\n\
+                         Comments: {comment_count}",
+                        body_text.len(),
+                    ))]));
+                }
+
+                // Check for existing pending service-gator reviews.
+                let list_endpoint = format!("repos/{}/pulls/{}/reviews", repo, pull_number);
+                let list_args = vec!["api".to_string(), "--method=GET".to_string(), list_endpoint];
+
+                let existing_ids: Vec<u64> = match self.exec_command("gh", &list_args).await {
+                    Ok(output) => serde_json::from_str::<Vec<serde_json::Value>>(&output)
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|r| {
+                            let state = r.get("state")?.as_str()?;
+                            let rbody = r.get("body")?.as_str()?;
+                            let id = r.get("id")?.as_u64()?;
+                            if state == "PENDING" && github::review_has_marker(rbody) {
+                                Some(id)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                    Err(ref e) => {
+                        tracing::warn!(
+                            operation = "github_pending_review",
+                            action = "list_existing",
+                            repo = %repo,
+                            pull_number = pull_number,
+                            error = %e,
+                            "failed to list existing reviews, proceeding with create"
+                        );
+                        Vec::new()
+                    }
+                };
+
+                if !existing_ids.is_empty() && !replace {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "A pending service-gator review already exists on \
+                         {repo}#{pull_number} (review id: {}). \
+                         Set replace=true to delete it and create a new one.",
+                        existing_ids[0]
+                    ))]));
+                }
+
+                // Delete existing reviews if replace is set
+                for old_id in &existing_ids {
+                    tracing::info!(
+                        operation = "github_pending_review",
+                        action = "replace_delete",
+                        repo = %repo,
+                        pull_number = pull_number,
+                        review_id = old_id,
+                        "deleting existing pending review (replace=true)"
+                    );
+                    let del_endpoint =
+                        format!("repos/{}/pulls/{}/reviews/{}", repo, pull_number, old_id);
+                    let del_args = vec![
+                        "api".to_string(),
+                        "--method=DELETE".to_string(),
+                        del_endpoint,
+                    ];
+                    if let Err(e) = self.exec_command("gh", &del_args).await {
+                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                            "Failed to delete existing review {old_id}: {e}"
+                        ))]));
+                    }
+                }
+
+                tracing::info!(
+                    operation = "github_pending_review",
+                    action = "create",
+                    repo = %repo,
+                    pull_number = pull_number,
+                    comment_count = comment_count,
+                    "creating pending review"
+                );
 
                 let args = vec![
                     "api".to_string(),
@@ -1547,10 +1650,16 @@ impl ServiceGatorServer {
 
     /// Manage pending PR reviews on GitHub.
     ///
-    /// Supports operations: list, create, get, update, delete.
+    /// Supports operations: list, create, get, update, delete, extended-help.
+    /// The create operation errors if a pending service-gator review already
+    /// exists; set replace=true to delete and recreate.
     /// Requires pending-review permission for the target repository.
     #[tool(description = "Manage pending PR reviews on GitHub. \
-        Operations: list, create, get, update, delete. \
+        Operations: list, create, get, update, delete, extended-help. \
+        The 'create' operation errors if a pending review already exists; \
+        set replace=true to delete and recreate. \
+        Set dry_run=true to validate without submitting. \
+        Use 'extended-help' for detailed documentation. \
         Requires pending-review permission for the target repository. \
         Use the 'status' tool to view your current permissions.")]
     async fn github_pending_review_tool(
@@ -1559,6 +1668,13 @@ impl ServiceGatorServer {
         Parameters(input): Parameters<GithubPendingReviewInput>,
     ) -> Result<CallToolResult, McpError> {
         let config = get_scopes_from_parts(&parts)?;
+
+        if input.operation.eq_ignore_ascii_case("extended-help") {
+            return Ok(CallToolResult::success(vec![Content::text(
+                REVIEW_TOOL_HELP,
+            )]));
+        }
+
         self.github_pending_review_impl(
             &config,
             &input.operation,
@@ -1567,6 +1683,8 @@ impl ServiceGatorServer {
             input.review_id,
             input.body.as_deref(),
             input.comments,
+            input.dry_run,
+            input.replace,
         )
         .await
     }
