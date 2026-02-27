@@ -112,6 +112,12 @@ pub struct GithubPushInput {
     /// The body/description of the pull request.
     #[serde(default)]
     pub body: Option<String>,
+    /// If true, push to the authenticated user's fork of the repo instead of the
+    /// upstream. The fork is discovered automatically via a GraphQL query. A draft
+    /// PR is still created on the *upstream* repo with a cross-repo head ref.
+    /// Default: false (push directly to the upstream repo).
+    #[serde(default)]
+    pub use_fork: bool,
 }
 
 fn default_true() -> bool {
@@ -899,15 +905,16 @@ impl ServiceGatorServer {
         let repo_string = input.repo.as_str();
         let repo = repo_string.as_str();
 
-        // Permission check for branch pushing
-        if !config.gh.is_allowed(repo, GhOpType::PushNewBranch, None) {
+        // When using a fork, PushNewBranch is checked on the fork repo (discovered
+        // below) rather than the upstream. Without a fork, check it on upstream.
+        if !input.use_fork && !config.gh.is_allowed(repo, GhOpType::PushNewBranch, None) {
             return Err(format!(
                 "push-new-branch permission not granted for github:{}",
                 repo
             ));
         }
 
-        // If creating a draft PR, also check for CreateDraft permission
+        // CreateDraft permission is always checked on the upstream repo
         if input.create_draft_pr && !config.gh.is_allowed(repo, GhOpType::CreateDraft, None) {
             return Err(format!(
                 "create-draft permission not granted for github:{}. \
@@ -938,6 +945,7 @@ impl ServiceGatorServer {
             commit = %input.commit_sha,
             branch_desc = %input.description,
             create_draft_pr = %input.create_draft_pr,
+            use_fork = %input.use_fork,
             "starting GitHub push operation"
         );
 
@@ -945,7 +953,113 @@ impl ServiceGatorServer {
         let token = crate::core::get_token_trimmed("GH_TOKEN", Some("GITHUB_TOKEN"))
             .ok_or("No GitHub token available (GH_TOKEN or GITHUB_TOKEN not set)")?;
 
-        let remote_url = format!("https://x-access-token:{}@github.com/{}.git", token, repo);
+        // If use_fork is set, discover the authenticated user's fork via GraphQL
+        // and push there instead of the upstream.
+        let (push_repo, fork_owner) = if input.use_fork {
+            let (upstream_owner, upstream_name) = repo
+                .split_once('/')
+                .ok_or_else(|| format!("Invalid repo format: {repo}"))?;
+
+            let graphql_query = serde_json::json!({
+                "query": "query($owner: String!, $repo: String!) { \
+                    repository(owner: $owner, name: $repo) { \
+                        forks(affiliations: [OWNER], first: 1) { \
+                            nodes { nameWithOwner url } \
+                        } \
+                    } \
+                }",
+                "variables": {
+                    "owner": upstream_owner,
+                    "repo": upstream_name,
+                }
+            });
+
+            let gql_args = vec![
+                "api".to_string(),
+                "graphql".to_string(),
+                "--input".to_string(),
+                "-".to_string(),
+            ];
+
+            let gql_payload = graphql_query.to_string();
+            let gql_output = self
+                .exec_command_with_stdin("gh", &gql_args, &gql_payload)
+                .await
+                .map_err(|e| format!("Failed to query for fork: {e}"))?;
+
+            // Check for process failure (exec_command_with_stdin returns Ok
+            // even on non-zero exit)
+            if gql_output.contains("[exit code:") {
+                return Err(format!("Fork discovery GraphQL query failed: {gql_output}"));
+            }
+
+            let gql_value: serde_json::Value = serde_json::from_str(&gql_output)
+                .map_err(|e| format!("Failed to parse fork query response: {e}"))?;
+
+            // Check for GraphQL-level errors (returned with HTTP 200)
+            if let Some(errors) = gql_value.get("errors") {
+                return Err(format!(
+                    "Fork discovery GraphQL query returned errors: {errors}"
+                ));
+            }
+
+            // Check that the repository was found
+            if gql_value.pointer("/data/repository").is_none() {
+                return Err(format!(
+                    "Repository {repo} not found or not accessible with the current token"
+                ));
+            }
+
+            let fork_node = gql_value
+                .pointer("/data/repository/forks/nodes/0")
+                .ok_or_else(|| {
+                    format!(
+                        "No fork of {repo} found owned by the authenticated user. \
+                         Create a fork first."
+                    )
+                })?;
+
+            let name_with_owner = fork_node
+                .get("nameWithOwner")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "Fork response missing nameWithOwner field".to_string())?;
+
+            let fork_owner = name_with_owner
+                .split_once('/')
+                .map(|(owner, _)| owner)
+                .ok_or_else(|| format!("Invalid fork nameWithOwner format: {name_with_owner}"))?;
+
+            // Check PushNewBranch permission on the fork repo.
+            // Note: the fork repo must be in the scope config (e.g. via
+            // --gh-repo 'fork-owner/repo:push-new-branch' or a wildcard
+            // like 'fork-owner/*:push-new-branch').
+            if !config
+                .gh
+                .is_allowed(name_with_owner, GhOpType::PushNewBranch, None)
+            {
+                return Err(format!(
+                    "push-new-branch permission not granted for fork github:{}. \
+                     Add it to the scope config (e.g. --gh-repo '{}:push-new-branch').",
+                    name_with_owner, name_with_owner
+                ));
+            }
+
+            tracing::info!(
+                operation = "github_push",
+                upstream = %repo,
+                fork = %name_with_owner,
+                "discovered user fork"
+            );
+
+            (name_with_owner.to_string(), Some(fork_owner.to_string()))
+        } else {
+            (repo.to_string(), None)
+        };
+
+        let remote_url = format!(
+            "https://x-access-token:{}@github.com/{}.git",
+            token, push_repo
+        );
 
         // Validate local repository
         let agent_repo_path = input.repo_path.as_path();
@@ -1050,7 +1164,7 @@ impl ServiceGatorServer {
         if !input.create_draft_pr {
             return Ok(format!(
                 "Successfully pushed commit {} to branch '{}' on github:{}",
-                input.commit_sha, branch, repo
+                input.commit_sha, branch, push_repo
             ));
         }
 
@@ -1081,10 +1195,17 @@ impl ServiceGatorServer {
             }
         };
 
+        // When pushing to a fork, GitHub requires the head ref in cross-repo
+        // format: "{fork_owner}:{branch}". Otherwise just the branch name.
+        let pr_head = match &fork_owner {
+            Some(owner) => format!("{owner}:{branch}"),
+            None => branch.clone(),
+        };
+
         let endpoint = format!("repos/{}/pulls", repo);
         let payload = serde_json::json!({
             "title": title.unwrap(),
-            "head": branch,
+            "head": pr_head,
             "base": base.unwrap(),
             "body": pr_body,
             "draft": true,
@@ -1884,17 +2005,45 @@ impl ServiceGatorServer {
             }
         };
 
+        // For fork-based PRs, the head branch lives in the fork repo, not the
+        // base repo. Use head.repo.full_name so this works for both same-repo
+        // and cross-repo (fork) PRs.
+        let head_repo = match pr_data["head"]["repo"]["full_name"].as_str() {
+            Some(name) => name.to_string(),
+            None => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "Could not find head repository (head.repo.full_name) in PR data".to_string(),
+                )]));
+            }
+        };
+
+        // If the head repo differs from the input repo (fork-based PR), verify
+        // we also have push permission on the fork.
+        if head_repo != repo_str {
+            let fork_has_write = config.gh.is_allowed(&head_repo, GhOpType::Write, None);
+            let fork_has_push = config
+                .gh
+                .is_allowed(&head_repo, GhOpType::PushNewBranch, None);
+            if !(fork_has_write || fork_has_push) {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "PR #{} head branch is in fork repo '{}', but push-new-branch permission is not granted for that repo",
+                    input.pull_number, head_repo
+                ))]));
+            }
+        }
+
         tracing::info!(
             operation = "gh_update_pr_head",
             repo = %repo_str,
+            head_repo = %head_repo,
             pull_number = %input.pull_number,
             branch = %branch_name,
             commit = %input.commit_sha,
             "updating PR head branch"
         );
 
-        // Update the branch ref
-        let ref_path = format!("repos/{}/git/refs/heads/{}", repo_str, branch_name);
+        // Update the branch ref in the head repo (which may be a fork)
+        let ref_path = format!("repos/{}/git/refs/heads/{}", head_repo, branch_name);
         let payload = serde_json::json!({
             "sha": input.commit_sha.as_str(),
             "force": true
@@ -1918,19 +2067,21 @@ impl ServiceGatorServer {
                     tracing::info!(
                         operation = "gh_update_pr_head",
                         repo = %repo_str,
+                        head_repo = %head_repo,
                         pull_number = %input.pull_number,
                         branch = %branch_name,
                         commit = %input.commit_sha,
                         "PR head updated successfully"
                     );
                     Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Successfully updated PR #{} branch '{}' to commit {}.",
-                        input.pull_number, branch_name, input.commit_sha
+                        "Successfully updated PR #{} branch '{}' in repo '{}' to commit {}.",
+                        input.pull_number, branch_name, head_repo, input.commit_sha
                     ))]))
                 } else {
                     tracing::error!(
                         operation = "gh_update_pr_head",
                         repo = %repo_str,
+                        head_repo = %head_repo,
                         pull_number = %input.pull_number,
                         error = %output,
                         "failed to update PR head"
@@ -1945,6 +2096,7 @@ impl ServiceGatorServer {
                 tracing::error!(
                     operation = "gh_update_pr_head",
                     repo = %repo_str,
+                    head_repo = %head_repo,
                     pull_number = %input.pull_number,
                     error = %e,
                     "failed to update PR head"
@@ -1995,6 +2147,9 @@ impl ServiceGatorServer {
                        By default creates a draft PR (set create_draft_pr=false to skip). \
                        The branch will be named 'agent-<description>'. Uses a safe push \
                        mechanism that doesn't execute any code from the local repository. \
+                       Set use_fork=true to push to the authenticated user's fork \
+                       (discovered automatically via GraphQL) instead of the upstream; \
+                       the PR is always created on the upstream. \
                        NOTE: Requires service-gator to have filesystem access to the local git repo."
     )]
     async fn github_push(
