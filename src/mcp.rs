@@ -1062,12 +1062,31 @@ impl ServiceGatorServer {
             "creating draft PR"
         );
 
+        // If no body was provided, use the commit message body.
+        // This matches the GitHub web UI behavior for single-commit PRs.
+        let pr_body = match &input.body {
+            Some(b) => b.clone(),
+            None => {
+                let log_args = vec![
+                    "log".to_string(),
+                    "-1".to_string(),
+                    "--format=%b".to_string(),
+                    input.commit_sha.to_string(),
+                ];
+                self.exec_command_in_dir("git", &log_args, trusted_clone_path_utf8)
+                    .await
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            }
+        };
+
         let endpoint = format!("repos/{}/pulls", repo);
         let payload = serde_json::json!({
             "title": title.unwrap(),
             "head": branch,
             "base": base.unwrap(),
-            "body": input.body.as_deref().unwrap_or(""),
+            "body": pr_body,
             "draft": true,
         });
 
