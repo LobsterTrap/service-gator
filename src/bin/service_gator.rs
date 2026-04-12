@@ -81,11 +81,6 @@ struct Cli {
     #[arg(long = "dual-mode")]
     dual_mode: bool,
 
-    /// Start HTTP proxy server on the given address (e.g., 127.0.0.1:8082)
-    /// Transparent proxy for CLI tools like gh, glab, etc.
-    #[arg(long = "http-proxy", value_name = "ADDR")]
-    http_proxy: Option<String>,
-
     /// Path to a TOML configuration file
     #[arg(long = "config", value_name = "PATH")]
     config_file: Option<std::path::PathBuf>,
@@ -264,11 +259,6 @@ fn try_main() -> Result<ExitCode> {
         );
     }
 
-    // HTTP proxy mode (separate from MCP/REST servers)
-    if let Some(addr) = cli.http_proxy {
-        return run_proxy_server(&addr, server_config);
-    }
-
     // For CLI commands, we only need the scope config
     let config = &server_config.scopes;
 
@@ -279,15 +269,6 @@ fn try_main() -> Result<ExitCode> {
         Some(Command::Forgejo { args }) => run_forgejo(config, args),
         None => bail!("no command provided; run 'service-gator --help' for usage"),
     }
-}
-
-/// Run the HTTP proxy server.
-fn run_proxy_server(addr: &str, config: ServerConfig) -> Result<ExitCode> {
-    let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
-    rt.block_on(service_gator::proxy::start_proxy_server(addr, config))
-        .context("HTTP proxy server failed")?;
-
-    Ok(ExitCode::SUCCESS)
 }
 
 /// Format a localhost address from a port number.

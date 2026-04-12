@@ -29,7 +29,7 @@ The deployment model would be OPA as a second binary in the container image, que
 
 The real costs are in the integration work and the user-facing complexity:
 
-- **Input document construction**: Every permission check site in `src/mcp.rs`, `src/proxy.rs`, `src/github.rs`, etc. would need to build a structured input document with the right context — method, resource, identity, timestamp, and for GraphQL, the parsed query AST. This is a nontrivial refactor across four forge backends.
+- **Input document construction**: Every permission check site in `src/mcp.rs`, `src/github.rs`, etc. would need to build a structured input document with the right context — method, resource, identity, timestamp, and for GraphQL, the parsed query AST. This is a nontrivial refactor across four forge backends.
 - **Policy authoring burden**: Most service-gator users want something like `"owner/repo" = { read = true, create-draft = true }`. They do not want to learn Rego. Rego's syntax is unintuitive for anyone who hasn't used it (implicit iteration, set comprehensions, partial rules). The TOML config should remain the primary interface, with OPA as an optional layer for users who need it.
 - **Debugging**: An unexpected denial from a Rego policy is harder to debug than reading a TOML file. OPA's decision log helps, but it's another thing to configure.
 

@@ -59,7 +59,6 @@ pub mod jira_types;
 pub mod logging;
 pub mod mcp;
 pub mod net;
-pub mod proxy;
 pub mod scope;
 pub mod secret;
 pub mod servers;
