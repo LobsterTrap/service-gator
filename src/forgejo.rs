@@ -195,7 +195,8 @@ pub fn extract_repo_from_api_path(path: &str) -> Option<String> {
 pub fn classify_forgejo_op(args: &[String], analysis: &ForgejoAnalysis) -> ForgejoOpType {
     match analysis.op_type {
         OpType::Read => ForgejoOpType::Read,
-        OpType::Write => {
+        // Comment and Create are JIRA-specific; treat as Write for Forgejo
+        OpType::Write | OpType::Comment | OpType::Create => {
             let (cmd, subcmd) = parse_forgejo_cmd(args);
 
             match (cmd.as_deref(), subcmd.as_deref()) {

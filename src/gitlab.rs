@@ -208,7 +208,8 @@ fn classify_method(method: &str) -> OpType {
 pub fn classify_gl_op(args: &[String], analysis: &GlAnalysis) -> GlOpType {
     match analysis.op_type {
         OpType::Read => GlOpType::Read,
-        OpType::Write => {
+        // Comment and Create are JIRA-specific; treat as Write for GitLab
+        OpType::Write | OpType::Comment | OpType::Create => {
             let (cmd, subcmd) = parse_gl_cmd(args);
 
             match (cmd.as_deref(), subcmd.as_deref()) {

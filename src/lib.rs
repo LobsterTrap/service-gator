@@ -1,33 +1,30 @@
-//! service-gator: Scope-restricted CLI wrapper for sandboxed AI agents.
+//! service-gator: Scope-restricted MCP server for sandboxed AI agents.
 //!
-//! This crate provides a security wrapper around CLI tools that access external
-//! services (GitHub, JIRA, etc.). It's designed for sandboxed AI agents that need
-//! controlled access to services where PAT/token-based auth grants broad access
-//! that needs to be restricted.
+//! This crate provides scope-restricted access to external services (GitHub,
+//! GitLab, Forgejo/Gitea, JIRA) for sandboxed AI agents. It runs as a daemon
+//! outside the agent's sandbox, holding credentials the agent cannot access
+//! directly, and exposes tools via the Model Context Protocol (MCP).
 //!
 //! # Security Model
 //!
 //! The fundamental security property is that the sandboxed AI agent cannot
-//! bypass restrictions by running a different binary - it must communicate with
-//! an external daemon that controls access. The daemon runs outside the sandbox
-//! and has access to secrets (tokens, credentials).
+//! bypass restrictions by accessing credentials directly — it must communicate
+//! with this daemon over MCP. The daemon runs outside the sandbox (typically
+//! in a separate container) and enforces per-repo/per-project scope
+//! restrictions on every operation.
 //!
 //! # Available Backends
 //!
-//! - `gh` / `gh-gator`: GitHub CLI wrapper with scope-based access control
-//! - `jira` / `jira-gator`: JIRA CLI wrapper with project-based access control
+//! - GitHub: scope-based access control with per-repo permissions
+//! - GitLab: scope-based access control with per-project permissions
+//! - Forgejo/Gitea: scope-based access control with per-repo permissions
+//! - JIRA: project and issue-level permissions
 //!
-//! # Usage Modes
+//! # Usage
 //!
-//! 1. **CLI mode**: Run commands directly with scope checking
-//!    ```sh
-//!    service-gator gh pr list -R owner/repo
-//!    ```
-//!
-//! 2. **MCP server mode**: Expose tools via Model Context Protocol
-//!    ```sh
-//!    service-gator --mcp-server 127.0.0.1:8080
-//!    ```
+//! ```sh
+//! service-gator --mcp-server 127.0.0.1:8080
+//! ```
 //!
 //! # Configuration
 //!
@@ -59,7 +56,6 @@ pub mod jira_types;
 pub mod logging;
 pub mod mcp;
 pub mod net;
-pub mod proxy;
 pub mod scope;
 pub mod secret;
 pub mod servers;

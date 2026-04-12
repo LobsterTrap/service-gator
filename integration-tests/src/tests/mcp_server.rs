@@ -31,7 +31,7 @@ fn get_denied_repo() -> String {
         let owner = get_test_owner();
         // Use a different repo under the same owner, or a well-known public repo
         if owner == "cgwalters" {
-            "cgwalters/service-gator".to_string()
+            "LobsterTrap/service-gator".to_string()
         } else {
             format!("{}/nonexistent-test-repo", owner)
         }

@@ -373,4 +373,83 @@ mod tests {
 
         assert!(config.jira.is_allowed("PROJ", OpType::Write, None));
     }
+
+    #[test]
+    fn test_jira_is_allowed_comment() {
+        let perm = JiraProjectPermission {
+            comment: true,
+            ..Default::default()
+        };
+        let config = make_jira_config_with_projects(vec![("PROJ", perm)]);
+
+        // comment implies read
+        assert!(config.jira.is_allowed("PROJ", OpType::Read, None));
+        assert!(config.jira.is_allowed("PROJ", OpType::Comment, None));
+        // comment does not imply create or write
+        assert!(!config.jira.is_allowed("PROJ", OpType::Create, None));
+        assert!(!config.jira.is_allowed("PROJ", OpType::Write, None));
+    }
+
+    #[test]
+    fn test_jira_is_allowed_create() {
+        let perm = JiraProjectPermission {
+            create: true,
+            ..Default::default()
+        };
+        let config = make_jira_config_with_projects(vec![("PROJ", perm)]);
+
+        // create implies read
+        assert!(config.jira.is_allowed("PROJ", OpType::Read, None));
+        assert!(config.jira.is_allowed("PROJ", OpType::Create, None));
+        // create does not imply comment or write
+        assert!(!config.jira.is_allowed("PROJ", OpType::Comment, None));
+        assert!(!config.jira.is_allowed("PROJ", OpType::Write, None));
+    }
+
+    #[test]
+    fn test_jira_write_implies_all() {
+        let perm = JiraProjectPermission {
+            write: true,
+            ..Default::default()
+        };
+        let config = make_jira_config_with_projects(vec![("PROJ", perm)]);
+
+        assert!(config.jira.is_allowed("PROJ", OpType::Read, None));
+        assert!(config.jira.is_allowed("PROJ", OpType::Comment, None));
+        assert!(config.jira.is_allowed("PROJ", OpType::Create, None));
+        assert!(config.jira.is_allowed("PROJ", OpType::Write, None));
+    }
+
+    #[test]
+    fn test_jira_global_read() {
+        let mut config = ScopeConfig::default();
+        config.jira.global_read = true;
+
+        // global_read allows reading any project
+        assert!(config.jira.is_allowed("ANYPROJ", OpType::Read, None));
+        assert!(config.jira.has_any_read_access());
+        // but not comment/create/write
+        assert!(!config.jira.is_allowed("ANYPROJ", OpType::Comment, None));
+        assert!(!config.jira.is_allowed("ANYPROJ", OpType::Create, None));
+        assert!(!config.jira.is_allowed("ANYPROJ", OpType::Write, None));
+    }
+
+    #[test]
+    fn test_jira_global_read_with_project_override() {
+        let mut config = ScopeConfig::default();
+        config.jira.global_read = true;
+        config.jira.projects.insert(
+            "PROJ".parse().unwrap(),
+            JiraProjectPermission {
+                comment: true,
+                ..Default::default()
+            },
+        );
+
+        // PROJ gets comment from explicit config
+        assert!(config.jira.is_allowed("PROJ", OpType::Comment, None));
+        // OTHER gets read from global_read but not comment
+        assert!(config.jira.is_allowed("OTHER", OpType::Read, None));
+        assert!(!config.jira.is_allowed("OTHER", OpType::Comment, None));
+    }
 }

@@ -1086,7 +1086,7 @@ dependencies = [
  "linkme",
  "paste",
  "reqwest",
- "rmcp 0.13.0",
+ "rmcp",
  "serde",
  "serde_json",
  "service-gator",
@@ -1928,32 +1928,6 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1815dbc06c414d720f8bc1951eccd66bc99efc6376331f1e7093a119b3eb508"
-dependencies = [
- "async-trait",
- "base64",
- "chrono",
- "futures",
- "http",
- "pastey",
- "pin-project-lite",
- "reqwest",
- "rmcp-macros 0.13.0",
- "schemars",
- "serde",
- "serde_json",
- "sse-stream",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "rmcp"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0a621b37a548ff6ab6292d57841eb25785a7f146d89391a19c9f199414bd13da"
@@ -1970,7 +1944,8 @@ dependencies = [
  "pastey",
  "pin-project-lite",
  "rand 0.9.2",
- "rmcp-macros 0.14.0",
+ "reqwest",
+ "rmcp-macros",
  "schemars",
  "serde",
  "serde_json",
@@ -1982,19 +1957,6 @@ dependencies = [
  "tower-service",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "rmcp-macros"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11f0bc7008fa102e771a76c6d2c9b253be3f2baa5964e060464d038ae1cbc573"
-dependencies = [
- "darling",
- "proc-macro2",
- "quote",
- "serde_json",
- "syn",
 ]
 
 [[package]]
@@ -2262,11 +2224,10 @@ dependencies = [
  "gouqi",
  "graphql-parser",
  "http",
- "hyper-util",
  "itertools",
  "jsonwebtoken",
  "kani-verifier",
- "rmcp 0.14.0",
+ "rmcp",
  "rustix",
  "serde",
  "serde_json",

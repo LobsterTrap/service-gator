@@ -36,8 +36,6 @@ impl AuthMiddleware {
             token_authority,
         }
     }
-
-    // TODO: Add auth middleware integration later
 }
 
 /// Authentication middleware function for axum.

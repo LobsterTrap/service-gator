@@ -1,11 +1,10 @@
-//! service-gator: Scope-restricted CLI wrapper for sandboxed AI agents.
+//! service-gator: Scope-restricted MCP server for sandboxed AI agents.
 //!
-//! Usage:
-//!   service-gator gh api repos/owner/repo/pulls
-//!   service-gator jira issue view PROJ-123
-//!
-//! MCP server mode:
+//! Primary usage (MCP server mode):
 //!   service-gator --mcp-server 127.0.0.1:8080
+//!
+//! CLI subcommands exist for local testing but are not a security boundary —
+//! only the MCP server mode provides credential isolation.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -43,7 +42,7 @@ fn init_tracing() {
     tracing_subscriber::registry().with(fmt_layer).init();
 }
 
-/// Scope-restricted CLI wrapper for sandboxed AI agents
+/// Scope-restricted MCP server for sandboxed AI agents
 #[derive(Parser)]
 #[command(name = "service-gator", version, about)]
 struct Cli {
@@ -54,37 +53,30 @@ struct Cli {
     #[arg(long = "mcp-server", value_name = "ADDR")]
     mcp_server: Option<String>,
 
-    /// Start all REST API forge servers on consecutive ports starting at ADDR.
+    /// [Experimental] Start all REST API forge servers on consecutive ports starting at ADDR.
     /// Convenience alias: GitHub=ADDR, GitLab=+1, Forgejo=+2, JIRA=+3.
-    #[arg(long = "rest-server", value_name = "ADDR")]
+    #[arg(long = "rest-server", value_name = "ADDR", hide = true)]
     rest_server: Option<String>,
 
-    /// Start GitHub REST proxy on 127.0.0.1:PORT (e.g., --github-port 8081)
-    #[arg(long = "github-port", value_name = "PORT")]
+    /// [Experimental] Start GitHub REST API server on 127.0.0.1:PORT
+    #[arg(long = "github-port", value_name = "PORT", hide = true)]
     github_port: Option<u16>,
 
-    /// Start GitLab REST proxy on 127.0.0.1:PORT (e.g., --gitlab-port 8082)
-    #[arg(long = "gitlab-port", value_name = "PORT")]
+    /// [Experimental] Start GitLab REST API server on 127.0.0.1:PORT
+    #[arg(long = "gitlab-port", value_name = "PORT", hide = true)]
     gitlab_port: Option<u16>,
 
-    /// Start Forgejo REST proxy on 127.0.0.1:PORT (e.g., --forgejo-port 8083)
-    #[arg(long = "forgejo-port", value_name = "PORT")]
+    /// [Experimental] Start Forgejo REST API server on 127.0.0.1:PORT
+    #[arg(long = "forgejo-port", value_name = "PORT", hide = true)]
     forgejo_port: Option<u16>,
 
-    /// Start JIRA REST proxy on 127.0.0.1:PORT (e.g., --jira-port 8084)
-    #[arg(long = "jira-port", value_name = "PORT")]
+    /// [Experimental] Start JIRA REST API server on 127.0.0.1:PORT
+    #[arg(long = "jira-port", value_name = "PORT", hide = true)]
     jira_port: Option<u16>,
 
-    /// Start both MCP and REST servers (dual mode)
-    /// MCP server runs on --mcp-server address (default: 127.0.0.1:8080)
-    /// REST servers run on --rest-server or per-forge ports (default: 127.0.0.1:8081+)
-    #[arg(long = "dual-mode")]
+    /// [Experimental] Start both MCP and REST servers (dual mode)
+    #[arg(long = "dual-mode", hide = true)]
     dual_mode: bool,
-
-    /// Start HTTP proxy server on the given address (e.g., 127.0.0.1:8082)
-    /// Transparent proxy for CLI tools like gh, glab, etc.
-    #[arg(long = "http-proxy", value_name = "ADDR")]
-    http_proxy: Option<String>,
 
     /// Path to a TOML configuration file
     #[arg(long = "config", value_name = "PATH")]
@@ -144,28 +136,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// GitHub CLI wrapper (use `service-gator gh` for scope info)
+    /// GitHub CLI (for local testing; not a security boundary)
     #[command(disable_help_flag = true)]
     Gh {
         /// Arguments passed to gh
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// GitLab CLI wrapper (use `service-gator gl` for scope info)
+    /// GitLab CLI (for local testing; not a security boundary)
     #[command(disable_help_flag = true)]
     Gl {
         /// Arguments passed to glab
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// JIRA CLI wrapper (use `service-gator jira` for scope info)
+    /// JIRA CLI (for local testing; not a security boundary)
     #[command(disable_help_flag = true)]
     Jira {
         /// Arguments passed to jirust-cli
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Forgejo/Gitea CLI wrapper (use `service-gator forgejo` for scope info)
+    /// Forgejo/Gitea CLI (for local testing; not a security boundary)
     #[command(disable_help_flag = true)]
     Forgejo {
         /// Arguments passed to tea
@@ -264,11 +256,6 @@ fn try_main() -> Result<ExitCode> {
         );
     }
 
-    // HTTP proxy mode (separate from MCP/REST servers)
-    if let Some(addr) = cli.http_proxy {
-        return run_proxy_server(&addr, server_config);
-    }
-
     // For CLI commands, we only need the scope config
     let config = &server_config.scopes;
 
@@ -279,15 +266,6 @@ fn try_main() -> Result<ExitCode> {
         Some(Command::Forgejo { args }) => run_forgejo(config, args),
         None => bail!("no command provided; run 'service-gator --help' for usage"),
     }
-}
-
-/// Run the HTTP proxy server.
-fn run_proxy_server(addr: &str, config: ServerConfig) -> Result<ExitCode> {
-    let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
-    rt.block_on(service_gator::proxy::start_proxy_server(addr, config))
-        .context("HTTP proxy server failed")?;
-
-    Ok(ExitCode::SUCCESS)
 }
 
 /// Format a localhost address from a port number.
@@ -1313,39 +1291,9 @@ fn run_jira(config: &ScopeConfig, args: Vec<String>) -> Result<ExitCode> {
             }
         };
 
-        // Parse the project key string into a typed key for lookup
-        let project_key_typed = project_key.parse::<JiraProjectKey>().ok();
-        let project_perms = project_key_typed
-            .as_ref()
-            .and_then(|k| config.jira.projects.get(k));
-        let allowed = match op_type {
-            service_gator::scope::OpType::Read => {
-                project_perms.map(|p| p.can_read()).unwrap_or(false)
-            }
-            service_gator::scope::OpType::Write => {
-                // Check for issue-specific permissions first
-                if let Some(issue) = &validated.issue {
-                    // Parse issue key for typed lookup
-                    let issue_key_typed = issue
-                        .parse::<service_gator::jira_types::JiraIssueKey>()
-                        .ok();
-                    let issue_perm = issue_key_typed
-                        .as_ref()
-                        .and_then(|k| config.jira.issues.get(k));
-                    if let Some(perm) = issue_perm {
-                        if perm.write {
-                            true
-                        } else {
-                            project_perms.map(|p| p.can_write()).unwrap_or(false)
-                        }
-                    } else {
-                        project_perms.map(|p| p.can_write()).unwrap_or(false)
-                    }
-                } else {
-                    project_perms.map(|p| p.can_write()).unwrap_or(false)
-                }
-            }
-        };
+        let allowed = config
+            .jira
+            .is_allowed(project_key, op_type, validated.issue.as_deref());
 
         if !allowed {
             let issue_info = validated
@@ -1457,6 +1405,10 @@ async fn execute_jira_command(
                     None => Ok(format!("Successfully unassigned {}", issue_key)),
                 }
             }
+            IssueAction::Comment(args) => {
+                client.add_comment(&args.issue, &args.body).await?;
+                Ok(format!("Successfully added comment to {}", args.issue))
+            }
         },
         JiraSubcommand::Project(project_cmd) => match &project_cmd.action {
             ProjectAction::List(_) => {
@@ -1489,6 +1441,7 @@ fn print_jira_help(config: &ScopeConfig) {
     println!("  issue list -p PROJECT [-o FORMAT]");
     println!("  issue show -i ISSUE-KEY [-o FORMAT]");
     println!("  issue create -p PROJECT -s SUMMARY [-d DESC] [-t TYPE] [-o FORMAT]");
+    println!("  issue comment -i ISSUE-KEY -b BODY");
     println!("  issue transition -i ISSUE-KEY [-t TRANSITION] [-o FORMAT]");
     println!("  issue assign -i ISSUE-KEY [-a ASSIGNEE] [-o FORMAT]");
     println!("  project list [-o FORMAT]");
@@ -1503,6 +1456,9 @@ fn print_jira_help(config: &ScopeConfig) {
             let mut caps = Vec::new();
             if perm.read {
                 caps.push("read");
+            }
+            if perm.comment {
+                caps.push("comment");
             }
             if perm.create {
                 caps.push("create");

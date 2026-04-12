@@ -26,14 +26,14 @@ The recommended deployment is the container image with CLI-based scope configura
 # Note: GITHUB_TOKEN is also accepted as an alternative to GH_TOKEN
 podman run --rm -p 8080:8080 \
   -e GH_TOKEN \
-  ghcr.io/cgwalters/service-gator:latest \
+  ghcr.io/lobstertrap/service-gator:latest \
   --mcp-server 0.0.0.0:8080 \
   --gh-repo myorg/myrepo:read
 
 # Multiple repos with different permissions
 podman run --rm -p 8080:8080 \
   -e GH_TOKEN -e JIRA_API_TOKEN \
-  ghcr.io/cgwalters/service-gator:latest \
+  ghcr.io/lobstertrap/service-gator:latest \
   --mcp-server 0.0.0.0:8080 \
   --gh-repo myorg/myrepo:read,push-new-branch,create-draft \
   --gh-repo myorg/other:read \
@@ -111,7 +111,7 @@ The separation of `push-new-branch` and `create-draft` permissions provides seve
 # Allow branch pushing to user's fork, PR creation on upstream repo
 podman run --rm -p 8080:8080 \
   -e GH_TOKEN \
-  ghcr.io/cgwalters/service-gator:latest \
+  ghcr.io/lobstertrap/service-gator:latest \
   --mcp-server 0.0.0.0:8080 \
   --gh-repo upstream/project:read,create-draft \
   --gh-repo user/project:read,push-new-branch
@@ -122,7 +122,7 @@ podman run --rm -p 8080:8080 \
 # Both branch operations and PR creation on the same repo
 podman run --rm -p 8080:8080 \
   -e GH_TOKEN \
-  ghcr.io/cgwalters/service-gator:latest \
+  ghcr.io/lobstertrap/service-gator:latest \
   --mcp-server 0.0.0.0:8080 \
   --gh-repo myorg/project:read,push-new-branch,create-draft
 ```
@@ -132,7 +132,7 @@ podman run --rm -p 8080:8080 \
 # Can create draft PRs but cannot push branches
 podman run --rm -p 8080:8080 \
   -e GH_TOKEN \
-  ghcr.io/cgwalters/service-gator:latest \
+  ghcr.io/lobstertrap/service-gator:latest \
   --mcp-server 0.0.0.0:8080 \
   --gh-repo myorg/project:read,create-draft
 ```
@@ -326,7 +326,7 @@ podman run --rm -p 8080:8080 \
   --secret sg_secret \
   -e GH_TOKEN_FILE=/run/secrets/gh_token \
   -e SERVICE_GATOR_SECRET_FILE=/run/secrets/sg_secret \
-  ghcr.io/cgwalters/service-gator:latest \
+  ghcr.io/lobstertrap/service-gator:latest \
   --mcp-server 0.0.0.0:8080 \
   --gh-repo myorg/myrepo:read
 ```
@@ -352,7 +352,7 @@ metadata:
 spec:
   containers:
   - name: service-gator
-    image: ghcr.io/cgwalters/service-gator:latest
+    image: ghcr.io/lobstertrap/service-gator:latest
     args:
     - --mcp-server
     - 0.0.0.0:8080
@@ -425,7 +425,7 @@ spec:
     spec:
       containers:
       - name: service-gator
-        image: ghcr.io/cgwalters/service-gator:latest
+        image: ghcr.io/lobstertrap/service-gator:latest
         args:
         - --mcp-server
         - 0.0.0.0:8080
@@ -477,7 +477,7 @@ podman run --rm -p 8080:8080 \
   -e GH_TOKEN \
   -e SERVICE_GATOR_SECRET="your-256-bit-secret" \
   -e SERVICE_GATOR_ADMIN_KEY="admin-secret" \
-  ghcr.io/cgwalters/service-gator:latest \
+  ghcr.io/lobstertrap/service-gator:latest \
   --mcp-server 0.0.0.0:8080 \
   --scope '{"server":{"mode":"required"}}'
 ```
@@ -598,7 +598,7 @@ agent), etc.
 ### Container (recommended)
 
 ```bash
-podman pull ghcr.io/cgwalters/service-gator:latest
+podman pull ghcr.io/lobstertrap/service-gator:latest
 ```
 
 ### From source

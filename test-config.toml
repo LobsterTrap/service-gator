@@ -10,7 +10,7 @@ read = true
 [gh.repos]
 # Allow specific test repositories
 "octocat/Hello-World" = { read = true, write = true, create-draft = true }
-"cgwalters/service-gator" = { read = true, write = true, create-draft = true }
+"LobsterTrap/service-gator" = { read = true, write = true, create-draft = true }
 
 [gitlab.projects]
 # Allow access to test GitLab projects

@@ -6,7 +6,7 @@
 
 use eyre::{Context, Result};
 use rmcp::{
-    model::{CallToolRequestParam, CallToolResult, ClientInfo, Implementation},
+    model::{CallToolRequestParams, CallToolResult, ClientInfo, Implementation},
     service::RunningService,
     transport::streamable_http_client::{
         StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
@@ -78,9 +78,10 @@ impl RmcpSession {
         let args = arguments.as_object().cloned();
 
         self.service
-            .call_tool(CallToolRequestParam {
+            .call_tool(CallToolRequestParams {
                 name: name.to_string().into(),
                 arguments: args,
+                meta: None,
                 task: None,
             })
             .await

@@ -1000,6 +1000,9 @@ pub struct JiraProjectPermission {
     /// Can read the project (list issues, view, etc.)
     #[serde(default)]
     pub read: bool,
+    /// Can comment on issues in this project.
+    #[serde(default)]
+    pub comment: bool,
     /// Can create issues in this project.
     #[serde(default)]
     pub create: bool,
@@ -1017,7 +1020,11 @@ impl JiraProjectPermission {
     }
 
     pub fn can_read(&self) -> bool {
-        self.read || self.write
+        self.read || self.comment || self.create || self.write
+    }
+
+    pub fn can_comment(&self) -> bool {
+        self.comment || self.write
     }
 
     pub fn can_create(&self) -> bool {
@@ -1035,6 +1042,9 @@ impl JiraProjectPermission {
 pub struct JiraIssuePermission {
     #[serde(default)]
     pub read: bool,
+    /// Can add comments to this issue.
+    #[serde(default)]
+    pub comment: bool,
     #[serde(default)]
     pub write: bool,
 }
@@ -1046,6 +1056,10 @@ pub struct JiraScope {
     /// JIRA server URL (e.g., "https://jira.example.com" or "https://company.atlassian.net")
     #[serde(default)]
     pub host: Option<String>,
+
+    /// Allow read access to all projects, not just those explicitly listed.
+    #[serde(default)]
+    pub global_read: bool,
 
     /// Username/email for authentication.
     /// For JIRA Cloud, this is typically your Atlassian account email.
@@ -1076,8 +1090,10 @@ impl JiraScope {
             if let Ok(parsed_issue_key) = issue_key.parse::<JiraIssueKey>() {
                 if let Some(issue_perm) = self.issues.get(&parsed_issue_key) {
                     return match op {
-                        OpType::Read => issue_perm.read,
-                        OpType::Write => issue_perm.write,
+                        OpType::Read => issue_perm.read || issue_perm.comment || issue_perm.write,
+                        OpType::Comment => issue_perm.comment || issue_perm.write,
+                        // Create doesn't apply at issue level (issues already exist)
+                        OpType::Create | OpType::Write => issue_perm.write,
                     };
                 }
             }
@@ -1088,17 +1104,25 @@ impl JiraScope {
             if let Some(project_perm) = self.projects.get(&project_key) {
                 return match op {
                     OpType::Read => project_perm.can_read(),
+                    OpType::Comment => project_perm.can_comment(),
+                    OpType::Create => project_perm.can_create(),
                     OpType::Write => project_perm.can_write(),
                 };
             }
         }
 
-        false
+        // Fall back to global_read for read operations
+        match op {
+            OpType::Read => self.global_read,
+            _ => false,
+        }
     }
 
     /// Check if the user has any read access to any project.
     pub fn has_any_read_access(&self) -> bool {
-        self.projects.values().any(|p| p.can_read()) || self.issues.values().any(|i| i.read)
+        self.global_read
+            || self.projects.values().any(|p| p.can_read())
+            || self.issues.values().any(|i| i.read)
     }
 
     /// Get JIRA host from config or environment.
@@ -1157,6 +1181,8 @@ pub struct ScopeConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpType {
     Read,
+    Comment,
+    Create,
     Write,
 }
 
