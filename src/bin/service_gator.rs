@@ -1,11 +1,10 @@
-//! service-gator: Scope-restricted CLI wrapper for sandboxed AI agents.
+//! service-gator: Scope-restricted MCP server for sandboxed AI agents.
 //!
-//! Usage:
-//!   service-gator gh api repos/owner/repo/pulls
-//!   service-gator jira issue view PROJ-123
-//!
-//! MCP server mode:
+//! Primary usage (MCP server mode):
 //!   service-gator --mcp-server 127.0.0.1:8080
+//!
+//! CLI subcommands exist for local testing but are not a security boundary —
+//! only the MCP server mode provides credential isolation.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -43,7 +42,7 @@ fn init_tracing() {
     tracing_subscriber::registry().with(fmt_layer).init();
 }
 
-/// Scope-restricted CLI wrapper for sandboxed AI agents
+/// Scope-restricted MCP server for sandboxed AI agents
 #[derive(Parser)]
 #[command(name = "service-gator", version, about)]
 struct Cli {
@@ -54,31 +53,29 @@ struct Cli {
     #[arg(long = "mcp-server", value_name = "ADDR")]
     mcp_server: Option<String>,
 
-    /// Start all REST API forge servers on consecutive ports starting at ADDR.
+    /// [Experimental] Start all REST API forge servers on consecutive ports starting at ADDR.
     /// Convenience alias: GitHub=ADDR, GitLab=+1, Forgejo=+2, JIRA=+3.
-    #[arg(long = "rest-server", value_name = "ADDR")]
+    #[arg(long = "rest-server", value_name = "ADDR", hide = true)]
     rest_server: Option<String>,
 
-    /// Start GitHub REST proxy on 127.0.0.1:PORT (e.g., --github-port 8081)
-    #[arg(long = "github-port", value_name = "PORT")]
+    /// [Experimental] Start GitHub REST API server on 127.0.0.1:PORT
+    #[arg(long = "github-port", value_name = "PORT", hide = true)]
     github_port: Option<u16>,
 
-    /// Start GitLab REST proxy on 127.0.0.1:PORT (e.g., --gitlab-port 8082)
-    #[arg(long = "gitlab-port", value_name = "PORT")]
+    /// [Experimental] Start GitLab REST API server on 127.0.0.1:PORT
+    #[arg(long = "gitlab-port", value_name = "PORT", hide = true)]
     gitlab_port: Option<u16>,
 
-    /// Start Forgejo REST proxy on 127.0.0.1:PORT (e.g., --forgejo-port 8083)
-    #[arg(long = "forgejo-port", value_name = "PORT")]
+    /// [Experimental] Start Forgejo REST API server on 127.0.0.1:PORT
+    #[arg(long = "forgejo-port", value_name = "PORT", hide = true)]
     forgejo_port: Option<u16>,
 
-    /// Start JIRA REST proxy on 127.0.0.1:PORT (e.g., --jira-port 8084)
-    #[arg(long = "jira-port", value_name = "PORT")]
+    /// [Experimental] Start JIRA REST API server on 127.0.0.1:PORT
+    #[arg(long = "jira-port", value_name = "PORT", hide = true)]
     jira_port: Option<u16>,
 
-    /// Start both MCP and REST servers (dual mode)
-    /// MCP server runs on --mcp-server address (default: 127.0.0.1:8080)
-    /// REST servers run on --rest-server or per-forge ports (default: 127.0.0.1:8081+)
-    #[arg(long = "dual-mode")]
+    /// [Experimental] Start both MCP and REST servers (dual mode)
+    #[arg(long = "dual-mode", hide = true)]
     dual_mode: bool,
 
     /// Path to a TOML configuration file
@@ -139,28 +136,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// GitHub CLI wrapper (use `service-gator gh` for scope info)
+    /// GitHub CLI (for local testing; not a security boundary)
     #[command(disable_help_flag = true)]
     Gh {
         /// Arguments passed to gh
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// GitLab CLI wrapper (use `service-gator gl` for scope info)
+    /// GitLab CLI (for local testing; not a security boundary)
     #[command(disable_help_flag = true)]
     Gl {
         /// Arguments passed to glab
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// JIRA CLI wrapper (use `service-gator jira` for scope info)
+    /// JIRA CLI (for local testing; not a security boundary)
     #[command(disable_help_flag = true)]
     Jira {
         /// Arguments passed to jirust-cli
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Forgejo/Gitea CLI wrapper (use `service-gator forgejo` for scope info)
+    /// Forgejo/Gitea CLI (for local testing; not a security boundary)
     #[command(disable_help_flag = true)]
     Forgejo {
         /// Arguments passed to tea
