@@ -1291,39 +1291,9 @@ fn run_jira(config: &ScopeConfig, args: Vec<String>) -> Result<ExitCode> {
             }
         };
 
-        // Parse the project key string into a typed key for lookup
-        let project_key_typed = project_key.parse::<JiraProjectKey>().ok();
-        let project_perms = project_key_typed
-            .as_ref()
-            .and_then(|k| config.jira.projects.get(k));
-        let allowed = match op_type {
-            service_gator::scope::OpType::Read => {
-                project_perms.map(|p| p.can_read()).unwrap_or(false)
-            }
-            service_gator::scope::OpType::Write => {
-                // Check for issue-specific permissions first
-                if let Some(issue) = &validated.issue {
-                    // Parse issue key for typed lookup
-                    let issue_key_typed = issue
-                        .parse::<service_gator::jira_types::JiraIssueKey>()
-                        .ok();
-                    let issue_perm = issue_key_typed
-                        .as_ref()
-                        .and_then(|k| config.jira.issues.get(k));
-                    if let Some(perm) = issue_perm {
-                        if perm.write {
-                            true
-                        } else {
-                            project_perms.map(|p| p.can_write()).unwrap_or(false)
-                        }
-                    } else {
-                        project_perms.map(|p| p.can_write()).unwrap_or(false)
-                    }
-                } else {
-                    project_perms.map(|p| p.can_write()).unwrap_or(false)
-                }
-            }
-        };
+        let allowed = config
+            .jira
+            .is_allowed(project_key, op_type, validated.issue.as_deref());
 
         if !allowed {
             let issue_info = validated
@@ -1435,6 +1405,10 @@ async fn execute_jira_command(
                     None => Ok(format!("Successfully unassigned {}", issue_key)),
                 }
             }
+            IssueAction::Comment(args) => {
+                client.add_comment(&args.issue, &args.body).await?;
+                Ok(format!("Successfully added comment to {}", args.issue))
+            }
         },
         JiraSubcommand::Project(project_cmd) => match &project_cmd.action {
             ProjectAction::List(_) => {
@@ -1467,6 +1441,7 @@ fn print_jira_help(config: &ScopeConfig) {
     println!("  issue list -p PROJECT [-o FORMAT]");
     println!("  issue show -i ISSUE-KEY [-o FORMAT]");
     println!("  issue create -p PROJECT -s SUMMARY [-d DESC] [-t TYPE] [-o FORMAT]");
+    println!("  issue comment -i ISSUE-KEY -b BODY");
     println!("  issue transition -i ISSUE-KEY [-t TRANSITION] [-o FORMAT]");
     println!("  issue assign -i ISSUE-KEY [-a ASSIGNEE] [-o FORMAT]");
     println!("  project list [-o FORMAT]");
@@ -1481,6 +1456,9 @@ fn print_jira_help(config: &ScopeConfig) {
             let mut caps = Vec::new();
             if perm.read {
                 caps.push("read");
+            }
+            if perm.comment {
+                caps.push("comment");
             }
             if perm.create {
                 caps.push("create");

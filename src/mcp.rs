@@ -2334,7 +2334,7 @@ impl ServiceGatorServer {
     /// Only explicitly allowed commands and options are permitted.
     /// Unknown commands or options are rejected for security.
     #[tool(
-        description = "Execute JIRA commands within configured scopes. Allowed commands: issue (list/show/create/transition/assign), project list, version list, search. Only explicitly allowed options are permitted. Use the 'status' tool to view current capabilities.\n\nSearch requires explicit project(s): search -p PROJECT [-p PROJECT2] -q JQL"
+        description = "Execute JIRA commands within configured scopes. Allowed commands: issue (list/show/create/comment/transition/assign), project list, version list, search. Only explicitly allowed options are permitted. Use the 'status' tool to view current capabilities.\n\nSearch requires explicit project(s): search -p PROJECT [-p PROJECT2] -q JQL\nComment on an issue: issue comment -i ISSUE-KEY -b BODY"
     )]
     async fn jira(
         &self,
@@ -2354,6 +2354,7 @@ impl ServiceGatorServer {
                      issue list -p PROJECT\n  \
                      issue show -i ISSUE-KEY\n  \
                      issue create -p PROJECT -s SUMMARY [-d DESC] [-t TYPE]\n  \
+                     issue comment -i ISSUE-KEY -b BODY\n  \
                      issue transition -i ISSUE-KEY [-t TRANSITION]\n  \
                      issue assign -i ISSUE-KEY [-a ASSIGNEE]\n  \
                      project list\n  \
@@ -2437,32 +2438,10 @@ impl ServiceGatorServer {
                 }
             };
 
-            let project_perms = config.jira.projects.get(&project_key);
-            let allowed = match op_type {
-                OpType::Read => project_perms.map(|p| p.can_read()).unwrap_or(false),
-                OpType::Write => {
-                    if let Some(issue_str) = &validated.issue {
-                        // Try to parse the issue key for permission lookup
-                        let issue_key_result = issue_str.parse::<crate::jira_types::JiraIssueKey>();
-                        if let Ok(issue_key) = issue_key_result {
-                            if let Some(issue_perm) = config.jira.issues.get(&issue_key) {
-                                if issue_perm.write {
-                                    true
-                                } else {
-                                    project_perms.map(|p| p.can_write()).unwrap_or(false)
-                                }
-                            } else {
-                                project_perms.map(|p| p.can_write()).unwrap_or(false)
-                            }
-                        } else {
-                            // Invalid issue key format, fall back to project permission
-                            project_perms.map(|p| p.can_write()).unwrap_or(false)
-                        }
-                    } else {
-                        project_perms.map(|p| p.can_write()).unwrap_or(false)
-                    }
-                }
-            };
+            let allowed =
+                config
+                    .jira
+                    .is_allowed(project_key.as_str(), op_type, validated.issue.as_deref());
 
             if !allowed {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
@@ -2643,6 +2622,26 @@ async fn execute_jira_command(
                     Some(user) => Ok(format!("Successfully assigned {} to {}", issue_key, user)),
                     None => Ok(format!("Successfully unassigned {}", issue_key)),
                 }
+            }
+            IssueAction::Comment(args) => {
+                tracing::info!(
+                    operation = "jira_comment_issue",
+                    issue = %args.issue,
+                    "adding comment to JIRA issue"
+                );
+                client
+                    .add_comment(&args.issue, &args.body)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(
+                            operation = "jira_comment_issue",
+                            issue = %args.issue,
+                            error = %e,
+                            "failed to add comment to JIRA issue"
+                        );
+                        e
+                    })?;
+                Ok(format!("Successfully added comment to {}", args.issue))
             }
         },
         JiraSubcommand::Project(project_cmd) => match &project_cmd.action {

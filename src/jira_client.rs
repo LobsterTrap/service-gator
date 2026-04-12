@@ -12,7 +12,7 @@
 use eyre::{Context, Result};
 use gouqi::r#async::Jira;
 use gouqi::{
-    Credentials, Issue, Project, SearchOptions, SearchResults, TransitionOption,
+    AddComment, Credentials, Issue, Project, SearchOptions, SearchResults, TransitionOption,
     TransitionTriggerOptions, Version,
 };
 
@@ -206,6 +206,16 @@ impl JiraClient {
                 Some(user) => format!("assigning {} to {}", issue_key, user),
                 None => format!("unassigning {}", issue_key),
             })
+    }
+
+    /// Add a comment to a JIRA issue.
+    pub async fn add_comment(&self, issue_key: &str, body: &str) -> Result<()> {
+        self.jira
+            .issues()
+            .comment(issue_key, AddComment::new(body))
+            .await
+            .with_context(|| format!("adding comment to {}", issue_key))?;
+        Ok(())
     }
 
     // =========================================================================

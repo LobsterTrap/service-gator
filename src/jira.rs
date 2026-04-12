@@ -75,6 +75,9 @@ pub enum IssueAction {
     Transition(IssueTransitionArgs),
     /// Assign an issue
     Assign(IssueAssignArgs),
+    /// Add a comment to an issue
+    #[command(name = "comment")]
+    Comment(IssueCommentArgs),
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -181,6 +184,18 @@ impl IssueAssignArgs {
     pub fn effective_issue(&self) -> Option<&JiraIssueKey> {
         self.issue.as_ref().or(self.issue_key.as_ref())
     }
+}
+
+/// Arguments for `issue comment`.
+#[derive(Debug, Clone, Parser)]
+pub struct IssueCommentArgs {
+    /// Issue key (e.g. PROJ-123)
+    #[arg(short = 'i', long = "issue")]
+    pub issue: String,
+
+    /// Comment body text
+    #[arg(short = 'b', long = "body")]
+    pub body: String,
 }
 
 // ============================================================================
@@ -386,6 +401,14 @@ fn extract_metadata(cmd: &JiraCommand) -> (Option<String>, Option<String>, Strin
                 };
                 (project, issue_str, desc)
             }
+            IssueAction::Comment(args) => {
+                let project = project_from_issue(&args.issue);
+                (
+                    project,
+                    Some(args.issue.clone()),
+                    "jira issue comment".to_string(),
+                )
+            }
         },
         JiraSubcommand::Project(project_cmd) => match &project_cmd.action {
             ProjectAction::List(_) => (None, None, "jira project list".to_string()),
@@ -501,6 +524,16 @@ pub fn build_command_args(cmd: &ValidatedJiraCommand) -> Vec<String> {
                 }
                 result
             }
+            IssueAction::Comment(args) => {
+                vec![
+                    "issue".to_string(),
+                    "comment".to_string(),
+                    "-i".to_string(),
+                    args.issue.clone(),
+                    "-b".to_string(),
+                    args.body.clone(),
+                ]
+            }
         },
         JiraSubcommand::Project(project_cmd) => match &project_cmd.action {
             ProjectAction::List(args) => {
@@ -549,9 +582,9 @@ pub fn classify_command(cmd: &ValidatedJiraCommand) -> OpType {
     match &cmd.command.command {
         JiraSubcommand::Issue(issue_cmd) => match &issue_cmd.action {
             IssueAction::List(_) | IssueAction::Show(_) => OpType::Read,
-            IssueAction::Create(_) | IssueAction::Transition(_) | IssueAction::Assign(_) => {
-                OpType::Write
-            }
+            IssueAction::Comment(_) => OpType::Comment,
+            IssueAction::Create(_) => OpType::Create,
+            IssueAction::Transition(_) | IssueAction::Assign(_) => OpType::Write,
         },
         JiraSubcommand::Project(project_cmd) => match &project_cmd.action {
             ProjectAction::List(_) => OpType::Read,
@@ -682,6 +715,8 @@ impl LegacyParsedArgs {
                         | "--transition"
                         | "-a"
                         | "--assignee"
+                        | "-b"
+                        | "--body"
                 ) {
                     skip_next = true;
                 }
@@ -774,7 +809,7 @@ mod tests {
         assert_eq!(result.project.as_deref(), Some("MYPROJ"));
 
         let op_type = classify_command(&result);
-        assert_eq!(op_type, OpType::Write);
+        assert_eq!(op_type, OpType::Create);
     }
 
     #[test]
@@ -863,13 +898,40 @@ mod tests {
     #[test]
     fn test_classify_write_commands() {
         let cmd = parse_command(&args("issue create -p PROJ -s Title")).unwrap();
-        assert_eq!(classify_command(&cmd), OpType::Write);
+        assert_eq!(classify_command(&cmd), OpType::Create);
 
         let cmd = parse_command(&args("issue transition -i PROJ-1 -t Done")).unwrap();
         assert_eq!(classify_command(&cmd), OpType::Write);
 
         let cmd = parse_command(&args("issue assign -i PROJ-1 -a user")).unwrap();
         assert_eq!(classify_command(&cmd), OpType::Write);
+    }
+
+    #[test]
+    fn test_classify_comment_command() {
+        let cmd = parse_command(&args("issue comment -i PROJ-1 -b hello")).unwrap();
+        assert_eq!(classify_command(&cmd), OpType::Comment);
+        assert_eq!(cmd.issue.as_deref(), Some("PROJ-1"));
+        assert_eq!(cmd.project.as_deref(), Some("PROJ"));
+    }
+
+    #[test]
+    fn test_parse_issue_comment() {
+        let a = vec![
+            "issue".to_string(),
+            "comment".to_string(),
+            "-i".to_string(),
+            "PROJ-42".to_string(),
+            "-b".to_string(),
+            "This is my comment".to_string(),
+        ];
+        let result = parse_command(&a).unwrap();
+        assert_eq!(result.issue.as_deref(), Some("PROJ-42"));
+        assert_eq!(result.project.as_deref(), Some("PROJ"));
+        assert!(result.description.contains("comment"));
+
+        let op_type = classify_command(&result);
+        assert_eq!(op_type, OpType::Comment);
     }
 
     // ========================================================================

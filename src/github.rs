@@ -589,7 +589,8 @@ fn analyze_graphql_api(args: &[String]) -> (OpType, String) {
 
     let description = match op_type {
         OpType::Read => "gh api graphql (query)".to_string(),
-        OpType::Write => "gh api graphql (mutation)".to_string(),
+        // Comment and Create are JIRA-specific; GraphQL mutations map to Write
+        OpType::Write | OpType::Comment | OpType::Create => "gh api graphql (mutation)".to_string(),
     };
 
     (op_type, description)
@@ -914,7 +915,8 @@ fn detect_repo_from_git() -> Result<String, String> {
 pub fn classify_gh_op(args: &[String], analysis: &GhAnalysis) -> GhOpType {
     match analysis.op_type {
         OpType::Read => GhOpType::Read,
-        OpType::Write => {
+        // Comment and Create are JIRA-specific; treat as Write for GitHub
+        OpType::Write | OpType::Comment | OpType::Create => {
             let (cmd, subcmd) = parse_gh_cmd(args);
 
             match (cmd.as_deref(), subcmd.as_deref()) {
