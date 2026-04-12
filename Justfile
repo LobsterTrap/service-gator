@@ -134,7 +134,7 @@ test-integration *ARGS: build-release
 # ============================================================================
 
 # Container image name
-CONTAINER_IMAGE := "ghcr.io/cgwalters/service-gator"
+CONTAINER_IMAGE := "ghcr.io/lobstertrap/service-gator"
 
 # Build the container image
 [group('container')]

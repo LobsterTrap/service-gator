@@ -222,7 +222,7 @@ fn get_denied_repo() -> String {
         let test_repo = get_test_repo();
         let owner = test_repo.split('/').next().unwrap_or("cgwalters");
         if owner == "cgwalters" {
-            "cgwalters/service-gator".to_string()
+            "LobsterTrap/service-gator".to_string()
         } else {
             format!("{}/nonexistent-test-repo", owner)
         }

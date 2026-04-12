@@ -50,7 +50,6 @@ use std::process::Command;
 
 use clap::Parser;
 use eyre::{bail, Result};
-use serde_json;
 
 use graphql_parser::query::{Definition, OperationDefinition};
 use itertools::Itertools;

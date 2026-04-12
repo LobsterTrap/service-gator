@@ -8,8 +8,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [workspace.dependencies]
 eyre = "0.6.12"
+rmcp = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3.24"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "signal"] }
 
 [package]
@@ -18,7 +20,7 @@ version = "0.2.0"
 edition = "2021"
 description = "Scope-restricted CLI wrapper for sandboxed AI agents"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/cgwalters/service-gator"
+repository = "https://github.com/LobsterTrap/service-gator"
 keywords = ["ai", "security", "sandbox", "mcp", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 rust-version = "1.75"
@@ -32,7 +34,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
-rmcp = { version = "0.14", features = ["server", "transport-streamable-http-server"] }
+rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 tokio = { workspace = true }
 tokio-util = "0.7"
 axum = "0.8"
@@ -61,7 +63,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rustix = { version = "1", features = ["fs"] }
 itertools = "0.14"
 camino = { version = "1.2.2", features = ["serde1"] }
-tempfile = "3.24.0"
+tempfile = { workspace = true }
 # Pin time to avoid 0.3.47 which has compile-time assertions that fail on older Rust
 # See: https://github.com/time-rs/time/issues/836
 time = ">=0.3,<0.3.47"
@@ -69,7 +71,6 @@ urlencoding = "2.1"
 
 [dev-dependencies]
 cap-std-ext = "4.0.7"
-itertools = "0.14"
 kani-verifier = "0.67"
 
 [lints]

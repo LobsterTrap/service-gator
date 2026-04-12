@@ -2676,7 +2676,7 @@ impl ServerHandler for ServiceGatorServer {
                 version: env!("CARGO_PKG_VERSION").into(),
                 title: Some("Scoped CLI access for AI agents".into()),
                 icons: None,
-                website_url: Some("https://github.com/cgwalters/service-gator".into()),
+                website_url: Some("https://github.com/LobsterTrap/service-gator".into()),
             },
             instructions: Some(
                 "service-gator: Scoped CLI access for AI agents with comprehensive capability introspection. \

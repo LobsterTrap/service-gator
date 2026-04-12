@@ -21,11 +21,11 @@ tokio = { workspace = true }
 libtest-mimic = "0.8"
 linkme = "0.3"
 paste = "1.0"
-tempfile = "3"
+tempfile = { workspace = true }
 # HTTP client for admin endpoints and raw requests
 reqwest = { version = "0.12", features = ["json", "blocking"] }
 # MCP client for proper protocol handling
-rmcp = { version = "0.13", features = ["client", "transport-streamable-http-client-reqwest"] }
+rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
 
 [lints]
 workspace = true
