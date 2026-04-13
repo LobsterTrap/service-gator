@@ -12,12 +12,13 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build-and-test:
     runs-on: ubuntu-24.04
     steps:
+      - name: Lowercase image name
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
 
       - name: Setup host (newer podman with heredoc support, just)
@@ -42,6 +43,8 @@ jobs:
             runner: ubuntu-24.04-arm
 
     steps:
+      - name: Lowercase image name
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
 
       - name: Setup host (newer podman with heredoc support, just)
@@ -82,6 +85,8 @@ jobs:
     if: github.event_name != 'pull_request'
 
     steps:
+      - name: Lowercase image name
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
