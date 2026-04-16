@@ -2380,19 +2380,23 @@ impl ServiceGatorServer {
             .map(|s| s.to_string());
 
         // Verify JIRA is configured
-        // Supports either:
-        // - Basic auth: host + username + token
-        // - Bearer auth: host + token (no username)
-        let (host, username, token) = match (
-            config.jira.host.as_ref(),
-            config.jira.username.as_ref(),
-            config.jira.token.as_ref(),
-        ) {
-            (Some(h), username, Some(t)) => (h.clone(), username.cloned(), t.clone()),
-            _ => {
-                return Ok(CallToolResult::error(vec![Content::text(
-                    "JIRA not configured. Set host and token (and optionally username) in the scope config.",
-                )]));
+        // Uses accessor methods that fall back to environment variables
+        // (JIRA_HOST, JIRA_USERNAME, JIRA_API_TOKEN)
+        let token = config.jira.token();
+        if token.is_empty() {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "JIRA not configured. Set JIRA_API_TOKEN or token in the scope config.",
+            )]));
+        }
+        let host = config.jira.host();
+        let username = {
+            let u = config.jira.username();
+            // The username() accessor falls back to $USER, which isn't meaningful
+            // for auth purposes. Only use it if explicitly configured.
+            if config.jira.username.is_some() || std::env::var("JIRA_USERNAME").is_ok() {
+                Some(u)
+            } else {
+                None
             }
         };
 
@@ -2410,10 +2414,10 @@ impl ServiceGatorServer {
                 }
             }
         } else if is_project_list {
-            // For project list, just check that at least one project is configured
-            if config.jira.projects.is_empty() {
+            // For project list, check that the user has some form of read access
+            if !config.jira.has_any_read_access() {
                 return Ok(CallToolResult::error(vec![Content::text(
-                    "No JIRA projects configured",
+                    "No JIRA read access configured",
                 )]));
             }
         } else {
@@ -2454,8 +2458,8 @@ impl ServiceGatorServer {
         // Create the JIRA client
         // Use bearer auth if no username, otherwise basic auth
         let client = match &username {
-            Some(user) => JiraClient::new(&host, user, token.expose_secret()),
-            None => JiraClient::with_bearer_token(&host, token.expose_secret()),
+            Some(user) => JiraClient::new(&host, user, &token),
+            None => JiraClient::with_bearer_token(&host, &token),
         };
         let client = match client {
             Ok(c) => c,
@@ -2958,8 +2962,8 @@ fn check_jira_availability(config: &ScopeConfig) -> ServiceStatus {
     let has_token = std::env::var("JIRA_API_TOKEN").is_ok() || config.jira.token.is_some();
     let has_username = std::env::var("JIRA_USERNAME").is_ok() || config.jira.username.is_some();
 
-    // Check if any projects are configured
-    let has_projects = !config.jira.projects.is_empty();
+    // Check if any read access is configured (projects, issues, or global_read)
+    let has_read_access = config.jira.has_any_read_access();
 
     let host_string = config
         .jira
@@ -2969,19 +2973,21 @@ fn check_jira_availability(config: &ScopeConfig) -> ServiceStatus {
         .unwrap_or_else(|| "not configured".to_string());
     let host = host_string.as_str();
 
-    if has_host && has_token && has_projects {
-        let project_count = config.jira.projects.len();
+    if has_host && has_token && has_read_access {
         let auth_method = if has_username {
             "Basic auth"
         } else {
             "Bearer token"
         };
+        let scope_desc = if config.jira.global_read {
+            "global read access".to_string()
+        } else {
+            let project_count = config.jira.projects.len();
+            format!("{} projects in scope", project_count)
+        };
         ServiceStatus {
             available: true,
-            details: format!(
-                "Connected to {} ({}), {} projects in scope",
-                host, auth_method, project_count
-            ),
+            details: format!("Connected to {} ({}), {}", host, auth_method, scope_desc),
         }
     } else {
         let mut missing = Vec::new();
@@ -2991,7 +2997,7 @@ fn check_jira_availability(config: &ScopeConfig) -> ServiceStatus {
         if !has_token {
             missing.push("JIRA_API_TOKEN");
         }
-        if !has_projects {
+        if !has_read_access {
             missing.push("project configuration");
         }
 
